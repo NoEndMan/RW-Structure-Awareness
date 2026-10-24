@@ -252,19 +252,19 @@ public final class JunctionRepair {
     }
 
     /**
-     * Drops the snapped stretches that reach into an end RoadWeaver's snap already cut.
+     * Keeps a road's already repaired junction from being snapped again, by removing every snapped stretch that
+     * touches it.
      * <p>
-     * A cut end is the road's leading or trailing segments without positions (the anchor and the lead segments),
-     * then its junction segments, SnapJunctionShaper.TRANSITION of them. Near a busy shared destination, another
-     * road's own repaired junction can lie right beside it. A snapped stretch reaching into the cut end would then
-     * cut the road a second time, against that other road, and "restore" the first repair's unpaved lead segments
-     * as the new junction.
+     * Why: once a road was cut and repaired (restoreJunction), its repaired end lies right on a main road. Near a
+     * busy shared destination, a third road can pass close to that end too. Without this filter, trySnap would see
+     * a snapped stretch there, cut the road a second time against that third road, and the repair would then treat
+     * the first repair's unpaved lead segments as the new junction, breaking the road where it joins.
      *
      * @param runs the snapped stretches extractRuns found, {first, last} segment index each, not changed, may be
      *             null
      * @param road the road being snapped, not changed, may be null
-     * @return {@code runs} itself when no end was cut, otherwise a new list of the snapped stretches clear of both
-     *         cut ends
+     * @return {@code runs} itself when the road has no cut end (or either argument is null or empty), otherwise a
+     *         new list of only the snapped stretches that touch no protected segment
      */
     public static List<int[]> runsOutsideCutEnds(List<int[]> runs, List<RoadSegmentPlacement> road) {
         if (runs == null || runs.isEmpty() || road == null || road.isEmpty()) {

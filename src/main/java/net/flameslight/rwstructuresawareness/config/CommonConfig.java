@@ -10,7 +10,7 @@ import java.util.List;
 import java.util.Set;
 
 public class CommonConfig {
-    public static final boolean DEFAULT_DEBUG_MOD = true;
+    public static final boolean DEFAULT_DEBUG_MOD = false;
     public static final boolean DEFAULT_BLOCK_UNDERGROUND_DESTINATIONS = true;
 
     public static final ForgeConfigSpec COMMON_SPEC;
