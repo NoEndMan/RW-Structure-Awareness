@@ -240,11 +240,11 @@ public final class RoadObstacles {
     }
 
     /**
-     * Finds the no-road zone any column of a run of segments lies in.
+     * Finds the no-road zone any column of a stretch of consecutive segments lies in.
      *
      * @param segments the road's segments, not changed
-     * @param s        the run's first segment index
-     * @param e        the run's last segment index
+     * @param s        the stretch's first segment index
+     * @param e        the stretch's last segment index
      * @return the zone's id, null if no column is in one
      */
     @Nullable
@@ -261,11 +261,11 @@ public final class RoadObstacles {
     }
 
     /**
-     * Tells whether a run of segments touches one of the road's own destinations.
+     * Tells whether a stretch of consecutive segments touches one of the road's own destinations.
      *
      * @param segments the road's segments, not changed
-     * @param s        the run's first segment index
-     * @param e        the run's last segment index
+     * @param s        the stretch's first segment index
+     * @param e        the stretch's last segment index
      * @return true if any column of segments s..e lies on a destination's footprint
      */
     public boolean touchesDestination(List<RoadSegmentPlacement> segments, int s, int e) {

@@ -16,6 +16,7 @@ import net.flameslight.rwstructuresawareness.types.road.RoadObstacles;
 import net.flameslight.rwstructuresawareness.road.RoadRerouter;
 import net.flameslight.rwstructuresawareness.RoadInsideRegionChunksRecorder;
 import net.flameslight.rwstructuresawareness.road.JunctionRepair;
+import net.flameslight.rwstructuresawareness.road.SnapJunctionShaper;
 import net.flameslight.rwstructuresawareness.roadweaver.RoadWeaverAccessor;
 import net.flameslight.rwstructuresawareness.StructureChunkRecorder;
 import net.flameslight.rwstructuresawareness.tunnel.RoadTunnelPlanner;
@@ -38,6 +39,7 @@ import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.StructureManager;
 import net.minecraft.world.level.block.Block;
@@ -72,6 +74,7 @@ import net.shiroha233.roadweaver.core.model.SpanType;
 import net.shiroha233.roadweaver.core.model.StructureConnection;
 import net.shiroha233.roadweaver.features.path.config.PathFeatureConfig;
 import net.shiroha233.roadweaver.features.path.pathlogic.core.Road;
+import net.shiroha233.roadweaver.features.path.pathlogic.pathfinding.RoadHeightInterpolator;
 import net.shiroha233.roadweaver.features.path.pathlogic.pathfinding.RoadPathCalculator;
 import net.shiroha233.roadweaver.pathfinding.cache.CoarseHeightBatchRequest;
 import net.shiroha233.roadweaver.pathfinding.cache.TerrainSamplingCache;
@@ -85,6 +88,7 @@ import net.shiroha233.roadweaver.postprocess.RoadSnapService;
 
 import java.lang.reflect.Method;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -717,7 +721,7 @@ public final class RoadWeaverHarness {
     public static void goalBRoadSearchDetoursAroundRecordedStructure(GameTestHelper helper) {
         ServerLevel level = helper.getLevel();
         /*
-            On land only: RoadWeaver straightens every bridge run over water after the search
+            On land only: RoadWeaver straightens every bridge stretch over water after the search
             (PathPostProcessor.straightenBridgeRuns), obstacles or not.
          */
         TerrainSamplingCache cache = new TerrainSamplingCache();
@@ -1043,7 +1047,7 @@ public final class RoadWeaverHarness {
     // ---- Fallback: tunnel under, or trim before, structures the road still crosses ----
 
     /**
-     * A run on the road's own destination is trimmed, never dug (the tunnel would surface inside it).
+     * A blocked stretch on the road's own destination is trimmed, never dug (the tunnel would surface inside it).
      * The same structure that isn't a destination is dug (tunnelPlannerDigsUnderShallowStructure).
      *
      * @param helper the test's helper
@@ -1067,7 +1071,7 @@ public final class RoadWeaverHarness {
             TunnelPlan plan = RoadTunnelPlanner.planFor(segments);
             H.check(plan != null, "no plan for a road crossing its destination");
             H.check(plan.tunnelBoxes.isEmpty(), "a tunnel was planned under the road's own destination");
-            H.check(plan.parts.size() == 2, "expected the run on the destination trimmed (2 parts), got %d", plan.parts.size());
+            H.check(plan.parts.size() == 2, "expected the blocked stretch on the destination trimmed (2 parts), got %d", plan.parts.size());
         } finally {
             RoadTunnelPlanner.clearPlan();
         }
@@ -1147,7 +1151,7 @@ public final class RoadWeaverHarness {
                         s.middlePos().toShortString());
             }
             for (BlockPos p : s.positions()) {
-                joins |= mainColumns.contains(CoordinateKeys.pack(p.getX(), p.getZ()));
+                joins |= touches(mainColumns, p.getX(), p.getZ());
                 nearest = Math.min(nearest, Math.max(Math.abs(p.getZ() - z) - 1, 0));
             }
             previous = s.positions();
@@ -1232,7 +1236,7 @@ public final class RoadWeaverHarness {
         List<Integer> junction = new ArrayList<>();
         for (int i = 0; i < segments.size(); i++) {
             for (BlockPos p : segments.get(i).positions()) {
-                if (mainColumns.contains(CoordinateKeys.pack(p.getX(), p.getZ()))) {
+                if (touches(mainColumns, p.getX(), p.getZ())) {
                     junction.add(i);
                     break;
                 }
@@ -1288,6 +1292,950 @@ public final class RoadWeaverHarness {
     }
 
     /**
+     * The x 24, z 97 case: a side road on high ground, 19 blocks above a main road it runs within 12 blocks of,
+     * both leading to the same destination. RoadWeaver's snap cuts the side road at their shared end and blends a
+     * junction onto the main road. After worldgen a walk must exist from the side road's first paved segment, down its own
+     * route and through the junction, into the main road: over edge-adjacent paved or cleared columns (the cleared
+     * ground between RoadWeaver's junction pieces), each passable from its
+     * floor up to the higher of the two floors + 1. Both roads have one segment per block, as RoadWeaver's own roads
+     * do, so their normal stretches are continuous.
+     *
+     * @param helper the test's helper
+     */
+    @GameTest(template = HarnessSetup.TEMPLATE, timeoutTicks = 300)
+    public static void snapJunctionAcrossHeightIsConnected(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        AcrossHeight layout = acrossHeight(level);
+        RoadData main = layout.main();
+        int x0 = layout.x0();
+        int z = layout.z();
+        RoadSnapService.snapAllRoads(level, x0, z, x0 + 200, z + 60);
+
+        RoadData side = storedRoadOwnedBy(level, layout.sideStart(), x0 - 30, z - 30, x0 + 230, z + 90);
+        H.check(side != null, "the side road is gone from storage after snapping");
+        List<RoadSegmentPlacement> segments = side.roadSegmentList();
+        H.check(isAnchor(segments.get(segments.size() - 1)), "harness: RoadWeaver didn't cut the side road at its shared end");
+        int[] ys = side.targetY().stream().mapToInt(Integer::intValue).toArray();
+        int lastPaved = segments.size() - 1;
+        while (lastPaved > 0 && isAnchor(segments.get(lastPaved))) {
+            lastPaved--;
+        }
+        int from = 10; // PathFeature never paves a road's first ~9 segments
+        List<String> junction = new ArrayList<>();
+        for (int i = Math.max(from, lastPaved - 40); i < segments.size(); i++) {
+            RoadSegmentPlacement s = segments.get(i);
+            junction.add(i + " " + s.middlePos().toShortString() + " y " + ys[i] + " "
+                    + (isAnchor(s) ? "no positions" : s.positions().size() + " col"));
+        }
+
+        Set<Long> chunks = new HashSet<>();
+        for (RoadData road : List.of(main, side)) {
+            for (RoadSegmentPlacement s : road.roadSegmentList()) {
+                for (BlockPos p : s.positions()) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        for (int dz = -1; dz <= 1; dz++) {
+                            chunks.add(ChunkPos.asLong((p.getX() >> 4) + dx, (p.getZ() >> 4) + dz));
+                        }
+                    }
+                }
+            }
+        }
+        for (long c : chunks) {
+            level.getChunk(ChunkPos.getX(c), ChunkPos.getZ(c));
+        }
+
+        /*
+            Floors of the paved columns, computed as SegmentPaver does, then of the cleared ones between the
+            junction pieces (TunnelCarver's). The main road keeps its own columns.
+         */
+        Map<Long, Integer> floors = new HashMap<>();
+        floorsOf(segments, ys, from, lastPaved, floors);
+        TunnelCarver.roadFloors(List.of(side), Integer.MIN_VALUE / 2, Integer.MIN_VALUE / 2, Integer.MAX_VALUE / 2,
+                Integer.MAX_VALUE / 2).forEach(floors::putIfAbsent);
+        int[] mainYs = main.targetY().stream().mapToInt(Integer::intValue).toArray();
+        Set<Long> mainColumns = floorsOf(main.roadSegmentList(), mainYs, 0, mainYs.length - 1, floors);
+
+        // Walk from the side road's own path over edge-adjacent paved columns.
+        ArrayDeque<Long> queue = new ArrayDeque<>();
+        Set<Long> reached = new HashSet<>();
+        for (BlockPos p : segments.get(from).positions()) {
+            long key = CoordinateKeys.pack(p.getX(), p.getZ());
+            if (floors.containsKey(key) && reached.add(key)) {
+                queue.add(key);
+            }
+        }
+        List<String> blocked = new ArrayList<>();
+        boolean joined = false;
+        while (!queue.isEmpty() && !joined) {
+            long key = queue.poll();
+            int x = CoordinateKeys.unpackA(key);
+            int zz = CoordinateKeys.unpackB(key);
+            joined = mainColumns.contains(key);
+            for (int[] d : new int[][]{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
+                long next = CoordinateKeys.pack(x + d[0], zz + d[1]);
+                Integer nextFloor = floors.get(next);
+                if (nextFloor == null || reached.contains(next)) {
+                    continue;
+                }
+                int top = Math.max(floors.get(key), nextFloor) + 1;
+                String wall = firstBlocking(level, x, zz, floors.get(key), top);
+                wall = wall != null ? wall : firstBlocking(level, x + d[0], zz + d[1], nextFloor, top);
+                if (wall == null) {
+                    reached.add(next);
+                    queue.add(next);
+                } else if (blocked.size() < 8) {
+                    blocked.add(wall);
+                }
+            }
+        }
+        if (!joined) {
+            H.log("junction across height: {}", junction);
+        }
+        H.check(joined, "main road not reachable from the side road: %d column(s) reached, blocked at %s",
+                reached.size(), blocked);
+        helper.succeed();
+    }
+
+    /**
+     * Road B's stretch 104..146 case: a side road passing 6 blocks beside a main road and 19 blocks above it, then
+     * leaving again (no shared destination, so no cut). Inside the snapped stretch, past RoadWeaver's junction
+     * segments at each end, the side road must be the main road: no column of its own beside it. The junction
+     * segments must be RoadWeaver's own pieces kept off the main road: each paves exactly its own cross-section moved
+     * as far as its middle, minus the main road's columns (one column when nothing is left). The pieces, the side road's own route and the main road must be joined through the
+     * side road's paved and cleared columns. A second snap of the area must record no tunnel box twice.
+     *
+     * @param helper the test's helper
+     */
+    @GameTest(template = HarnessSetup.TEMPLATE)
+    public static void snapStretchStaysOnMainRoad(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        MiddleStretch layout = middleStretch(level);
+        SnappedStretch snapped = snapMiddleStretch(level, layout);
+        RoadData side = snapped.side();
+        int runStart = snapped.runStart();
+        int runEnd = snapped.runEnd();
+        List<RoadSegmentPlacement> segments = side.roadSegmentList();
+        int trans = SnapJunctionShaper.TRANSITION;
+        List<String> beside = new ArrayList<>();
+        int count = 0;
+        for (int i = runStart + trans; i <= runEnd - trans; i++) {
+            for (BlockPos p : segments.get(i).positions()) {
+                if (Math.abs(p.getZ() - layout.z()) > H.WIDTH / 2) {
+                    count++;
+                    if (beside.size() < 8) {
+                        beside.add(i + " " + p.toShortString());
+                    }
+                    break;
+                }
+            }
+        }
+        H.check(count == 0, "%d snapped segment(s) of stretch %d..%d pave a road of their own beside the main road "
+                + "(only %d junction segments at each end may): %s", count, runStart, runEnd, trans, beside);
+        List<RoadSegmentPlacement> before = layout.side().roadSegmentList();
+        List<String> notPieces = new ArrayList<>();
+        for (int i = runStart; i <= runEnd; i++) {
+            if (i >= runStart + trans && i <= runEnd - trans) {
+                continue;
+            }
+            BlockPos was = before.get(i).middlePos();
+            BlockPos now = segments.get(i).middlePos();
+            Set<Long> piece = new HashSet<>();
+            for (BlockPos p : before.get(i).positions()) {
+                piece.add(CoordinateKeys.pack(p.getX() + now.getX() - was.getX(), p.getZ() + now.getZ() - was.getZ()));
+            }
+            piece.removeIf(c -> Math.abs(CoordinateKeys.unpackB(c) - layout.z()) <= H.WIDTH / 2); // off the main road
+            Set<Long> paved = columnsOf(segments.get(i));
+            boolean ok = piece.isEmpty() ? paved.size() == 1 : paved.equals(piece);
+            if (!ok && notPieces.size() < 8) {
+                long onMain = paved.stream().filter(c -> Math.abs(CoordinateKeys.unpackB(c) - layout.z()) <= H.WIDTH / 2)
+                        .count();
+                notPieces.add(i + " (" + paved.size() + " columns, " + onMain + " on the main road, own piece off it "
+                        + piece.size() + ")");
+            }
+        }
+        H.check(notPieces.isEmpty(), "junction segment(s) aren't RoadWeaver's own pieces kept off the main road: %s",
+                notPieces);
+
+        // Paved or cleared side road columns, walked from the side road's own route into the main road.
+        Set<Long> open = new HashSet<>(TunnelCarver.roadFloors(List.of(side), Integer.MIN_VALUE / 2,
+                Integer.MIN_VALUE / 2, Integer.MAX_VALUE / 2, Integer.MAX_VALUE / 2).keySet());
+        for (RoadSegmentPlacement s : segments) {
+            open.addAll(columnsOf(s));
+        }
+        List<String> cutOff = new ArrayList<>();
+        for (int outside : new int[]{runStart - 1, runEnd + 1}) {
+            ArrayDeque<Long> queue = new ArrayDeque<>(columnsOf(segments.get(outside)));
+            Set<Long> reached = new HashSet<>(queue);
+            boolean joined = false;
+            while (!queue.isEmpty() && !joined) {
+                long c = queue.poll();
+                int x = CoordinateKeys.unpackA(c);
+                int zz = CoordinateKeys.unpackB(c);
+                joined = Math.abs(zz - layout.z()) <= H.WIDTH / 2;
+                for (int[] d : new int[][]{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}) {
+                    long next = CoordinateKeys.pack(x + d[0], zz + d[1]);
+                    if (open.contains(next) && reached.add(next)) {
+                        queue.add(next);
+                    }
+                }
+            }
+            if (!joined) {
+                cutOff.add("from segment " + outside + " (" + reached.size() + " columns reached)");
+            }
+        }
+        H.check(cutOff.isEmpty(), "the main road can't be reached over the side road's paved and cleared columns: %s",
+                cutOff);
+
+        Set<Long> chunks = chunksOf(side);
+        int boxes = tunnelBoxInts(chunks);
+        RoadSnapService.snapAllRoads(level, layout.x0(), layout.z() - 10, layout.x0() + 300, layout.z() + 90);
+        H.check(tunnelBoxInts(chunks) == boxes, "a second snap of the area recorded tunnel boxes again (%d -> %d ints)",
+                boxes, tunnelBoxInts(chunks));
+        helper.succeed();
+    }
+
+    /**
+     * The same layout: the side road's height difference to the main road is spread over its own route outside the
+     * snapped stretch, as RoadWeaver's slope setting allows. Right outside each edge it is near the main road's
+     * height, every two segments it changes by at most maxSlopeStepPerTwoSegments, and its far ends keep their own
+     * height. Its columns outside the stretch stay where they were: the stretch is found as the segments whose
+     * columns moved, and must lie well inside the road.
+     *
+     * @param helper the test's helper
+     */
+    @GameTest(template = HarnessSetup.TEMPLATE)
+    public static void snapRampFollowsSlopeSetting(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        MiddleStretch layout = middleStretch(level);
+        SnappedStretch snapped = snapMiddleStretch(level, layout);
+        int runStart = snapped.runStart();
+        int runEnd = snapped.runEnd();
+        List<Integer> ys = snapped.side().targetY();
+        int n = ys.size();
+        int step2 = RoadWeaverAccessor.slopeLimitEnabled() ? RoadWeaverAccessor.maxSlopeStepPerTwoSegments()
+                : RoadWeaverAccessor.UNLIMITED_SLOPE_STEP;
+        int trans = SnapJunctionShaper.TRANSITION;
+
+        int near = (step2 * (trans + 1) + 1) / 2;
+        int atStart = ys.get(runStart - 1);
+        int atEnd = ys.get(runEnd + 1);
+        H.check(Math.abs(atStart - layout.mainY()) <= near && Math.abs(atEnd - layout.mainY()) <= near,
+                "no ramp outside the stretch: the side road is at y %d and %d right outside it, the main road at y %d "
+                        + "(at most %d apart allowed with a slope step of %d per two segments)", atStart, atEnd,
+                layout.mainY(), near, step2);
+        List<String> steep = new ArrayList<>();
+        for (int i = 0; i + 2 < n; i++) {
+            boolean outside = i + 2 < runStart || i > runEnd;
+            if (outside && Math.abs(ys.get(i) - ys.get(i + 2)) > step2 && steep.size() < 8) {
+                steep.add(i + ": y " + ys.get(i) + " -> " + ys.get(i + 2));
+            }
+        }
+        H.check(steep.isEmpty(), "the ramp is steeper than %d per two segments: %s", step2, steep);
+        H.check(ys.get(0) == layout.sideY() && ys.get(n - 1) == layout.sideY(),
+                "the side road's far ends lost their own height %d: y %d and %d", layout.sideY(), ys.get(0), ys.get(n - 1));
+        helper.succeed();
+    }
+
+    /**
+     * The x 24, z 97 layout: the cut side road's junction, and every segment of its own route lowered toward the
+     * main road, carry a tunnel stretch with tunnel boxes, so worldgen clears them like RWSA's own tunnels. After
+     * worldgen, nothing solid is left above any of their road columns, up to RoadWeaver's clear height. A second
+     * snap of the area records no tunnel box twice.
+     *
+     * @param helper the test's helper
+     */
+    @GameTest(template = HarnessSetup.TEMPLATE, timeoutTicks = 300)
+    public static void snapJunctionIsCleared(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        AcrossHeight layout = acrossHeight(level);
+        int x0 = layout.x0();
+        int z = layout.z();
+        RoadSnapService.snapAllRoads(level, x0, z, x0 + 200, z + 60);
+
+        RoadData side = storedRoadOwnedBy(level, layout.sideStart(), x0 - 30, z - 30, x0 + 230, z + 90);
+        H.check(side != null, "the side road is gone from storage after snapping");
+        List<RoadSegmentPlacement> segments = side.roadSegmentList();
+        H.check(isAnchor(segments.get(segments.size() - 1)), "harness: RoadWeaver didn't cut the side road at its shared end");
+        int lastPaved = segments.size() - 1;
+        while (lastPaved > 0 && isAnchor(segments.get(lastPaved))) {
+            lastPaved--;
+        }
+        boolean[] tunnel = TunnelCarver.getTunnelSegmentsByRoadData(side);
+        H.check(tunnel != null, "the snapped side road has no tunnel stretch, so its junction isn't cleared (stretches %s)",
+                side.spans().stream().map(s -> s.type() + "@" + s.start().toShortString()).toList());
+        List<Integer> original = layout.side().targetY();
+        int trans = SnapJunctionShaper.TRANSITION;
+        List<String> uncleared = new ArrayList<>();
+        int lowered = 0;
+        for (int i = 0; i <= lastPaved; i++) {
+            boolean junction = i > lastPaved - trans;
+            boolean dug = !junction && side.targetY().get(i) < original.get(i);
+            lowered += dug ? 1 : 0;
+            if ((junction || dug) && !tunnel[i] && uncleared.size() < 8) {
+                uncleared.add(i + (junction ? " junction" : " lowered to y " + side.targetY().get(i)));
+            }
+        }
+        H.check(uncleared.isEmpty(), "segment(s) without the tunnel clearing: %s", uncleared);
+        H.check(lowered > 0, "harness: no segment of the side road's own route was lowered toward the main road");
+
+        Set<Long> chunks = new HashSet<>();
+        for (int i = 0; i < tunnel.length; i++) {
+            if (tunnel[i]) {
+                for (BlockPos p : segments.get(i).positions()) {
+                    chunks.add(ChunkPos.asLong(p.getX() >> 4, p.getZ() >> 4));
+                }
+            }
+        }
+        int boxes = tunnelBoxInts(chunks);
+        H.check(boxes > 0, "no tunnel box recorded for the cleared segments, so worldgen won't clear them");
+        RoadSnapService.snapAllRoads(level, x0, z, x0 + 200, z + 60);
+        H.check(tunnelBoxInts(chunks) == boxes, "a second snap of the area recorded tunnel boxes again (%d -> %d ints)",
+                boxes, tunnelBoxInts(chunks));
+
+        Set<Long> around = new HashSet<>();
+        for (long c : chunks) {
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    around.add(ChunkPos.asLong(ChunkPos.getX(c) + dx, ChunkPos.getZ(c) + dz));
+                }
+            }
+        }
+        for (long c : around) {
+            level.getChunk(ChunkPos.getX(c), ChunkPos.getZ(c));
+        }
+        int clear = RoadWeaverAccessor.roadClearHeight();
+        // With the main road too: its columns at about the junction's height are its own, never cleared.
+        Long2IntOpenHashMap floors = TunnelCarver.roadFloors(List.of(side, layout.main()), Integer.MIN_VALUE / 2,
+                Integer.MIN_VALUE / 2, Integer.MAX_VALUE / 2, Integer.MAX_VALUE / 2);
+        H.check(!floors.isEmpty(), "no cleared road columns");
+        int solid = 0;
+        List<String> samples = new ArrayList<>();
+        for (Long2IntMap.Entry e : floors.long2IntEntrySet()) {
+            int x = CoordinateKeys.unpackA(e.getLongKey());
+            int zz = CoordinateKeys.unpackB(e.getLongKey());
+            for (int y = e.getIntValue(); y < e.getIntValue() + clear; y++) {
+                BlockState state = level.getBlockState(new BlockPos(x, y, zz));
+                if (!state.isAir() && state.getFluidState().isEmpty()) {
+                    solid++;
+                    if (samples.size() < 8) {
+                        samples.add(x + "," + y + "," + zz + " " + state.getBlock() + " (floor " + e.getIntValue() + ")");
+                    }
+                }
+            }
+        }
+        H.check(solid == 0, "%d solid block(s) above %d cleared road column(s): %s", solid, floors.size(), samples);
+
+        /*
+            The main road's surface under and next to the junction is still its own (stone bricks): the clearing never
+            digs it out, and the junction pieces never pave the side road's gravel over it.
+         */
+        RoadData main = layout.main();
+        List<RoadSegmentPlacement> mainSegments = main.roadSegmentList();
+        int[] mainYs = main.targetY().stream().mapToInt(Integer::intValue).toArray();
+        List<BlockPos> junctionMiddles = new ArrayList<>();
+        for (int i = Math.max(0, lastPaved - trans + 1); i <= lastPaved; i++) {
+            junctionMiddles.add(segments.get(i).middlePos());
+        }
+        Map<Long, Integer> mainFloors = new HashMap<>();
+        for (int i = 0; i < mainSegments.size(); i++) {
+            BlockPos m = mainSegments.get(i).middlePos();
+            boolean near = false;
+            for (BlockPos j : junctionMiddles) {
+                near |= Math.max(Math.abs(m.getX() - j.getX()), Math.abs(m.getZ() - j.getZ())) <= 12;
+            }
+            if (near) {
+                floorsOf(mainSegments, mainYs, i, i, mainFloors);
+            }
+        }
+        H.check(!mainFloors.isEmpty(), "harness: no main road column near the junction");
+        List<String> dug = new ArrayList<>();
+        for (Map.Entry<Long, Integer> e : mainFloors.entrySet()) {
+            BlockPos surface = new BlockPos(CoordinateKeys.unpackA(e.getKey()), e.getValue() - 1,
+                    CoordinateKeys.unpackB(e.getKey()));
+            BlockState state = level.getBlockState(surface);
+            if (!state.is(Blocks.STONE_BRICKS) && dug.size() < 8) {
+                dug.add(surface.toShortString() + " " + state.getBlock());
+            }
+        }
+        H.check(dug.isEmpty(), "the main road's surface next to the junction isn't its own: %s (of %d columns)", dug,
+                mainFloors.size());
+        helper.succeed();
+    }
+
+    /**
+     * Spawn's case: the chunks where the side road's junction falls were decorated before the roads were saved, so
+     * RoadWeaver never paves the roads there. Nothing may be cleared there either: no TUNNEL segment has its middle
+     * in those chunks, and after everything around them generates, no block that was solid there turned into air,
+     * except next to segments RoadWeaver paves from a neighbouring chunk (their paving reaches a few columns across).
+     *
+     * @param helper the test's helper
+     */
+    @GameTest(template = HarnessSetup.TEMPLATE, timeoutTicks = 300)
+    public static void snapJunctionNotClearedWhereNotPaved(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        AcrossHeight layout = acrossHeight(level, true);
+        int x0 = layout.x0();
+        int z = layout.z();
+        int lowY = Integer.MAX_VALUE;
+        int highY = Integer.MIN_VALUE;
+        for (RoadData road : List.of(layout.main(), layout.side())) {
+            for (int y : road.targetY()) {
+                lowY = Math.min(lowY, y - 2);
+                highY = Math.max(highY, y + RoadWeaverAccessor.roadClearHeight() + 2);
+            }
+        }
+        Map<Long, List<Integer>> solidBefore = new HashMap<>();
+        for (long c : layout.pregenerated()) {
+            for (int x = ChunkPos.getX(c) << 4; x < (ChunkPos.getX(c) + 1) << 4; x++) {
+                for (int zz = ChunkPos.getZ(c) << 4; zz < (ChunkPos.getZ(c) + 1) << 4; zz++) {
+                    List<Integer> solid = new ArrayList<>();
+                    for (int y = lowY; y <= highY; y++) {
+                        BlockState state = level.getBlockState(new BlockPos(x, y, zz));
+                        if (!state.isAir() && state.getFluidState().isEmpty()) {
+                            solid.add(y);
+                        }
+                    }
+                    solidBefore.put(CoordinateKeys.pack(x, zz), solid);
+                }
+            }
+        }
+
+        RoadSnapService.snapAllRoads(level, x0, z, x0 + 200, z + 60);
+        RoadData side = storedRoadOwnedBy(level, layout.sideStart(), x0 - 30, z - 30, x0 + 230, z + 90);
+        H.check(side != null, "the side road is gone from storage after snapping");
+        List<RoadSegmentPlacement> segments = side.roadSegmentList();
+        boolean[] tunnel = TunnelCarver.getTunnelSegmentsByRoadData(side);
+        List<String> marked = new ArrayList<>();
+        for (int i = 0; tunnel != null && i < segments.size(); i++) {
+            BlockPos m = segments.get(i).middlePos();
+            if (tunnel[i] && layout.pregenerated().contains(ChunkPos.asLong(m.getX() >> 4, m.getZ() >> 4))
+                    && marked.size() < 8) {
+                marked.add(i + " " + m.toShortString());
+            }
+        }
+        H.check(marked.isEmpty(), "TUNNEL segment(s) in chunks decorated before the road was saved: %s", marked);
+
+        // Columns RoadWeaver paves from a neighbouring chunk, and a few columns around them, may change.
+        Set<Long> pavedNearby = new HashSet<>();
+        Set<Long> chunks = new HashSet<>();
+        for (RoadData road : List.of(layout.main(), side)) {
+            for (RoadSegmentPlacement s : road.roadSegmentList()) {
+                BlockPos m = s.middlePos();
+                boolean pavedElsewhere = !layout.pregenerated().contains(ChunkPos.asLong(m.getX() >> 4, m.getZ() >> 4));
+                for (BlockPos p : s.positions()) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        for (int dz = -1; dz <= 1; dz++) {
+                            chunks.add(ChunkPos.asLong((p.getX() >> 4) + dx, (p.getZ() >> 4) + dz));
+                        }
+                    }
+                    if (pavedElsewhere) {
+                        for (int dx = -4; dx <= 4; dx++) {
+                            for (int dz = -4; dz <= 4; dz++) {
+                                pavedNearby.add(CoordinateKeys.pack(p.getX() + dx, p.getZ() + dz));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (long c : chunks) {
+            level.getChunk(ChunkPos.getX(c), ChunkPos.getZ(c));
+        }
+        List<String> cleared = new ArrayList<>();
+        int count = 0;
+        for (Map.Entry<Long, List<Integer>> e : solidBefore.entrySet()) {
+            if (pavedNearby.contains(e.getKey())) {
+                continue;
+            }
+            int x = CoordinateKeys.unpackA(e.getKey());
+            int zz = CoordinateKeys.unpackB(e.getKey());
+            for (int y : e.getValue()) {
+                if (level.getBlockState(new BlockPos(x, y, zz)).isAir()) {
+                    count++;
+                    if (cleared.size() < 8) {
+                        cleared.add(x + "," + y + "," + zz);
+                    }
+                }
+            }
+        }
+        H.check(count == 0, "%d block(s) cleared in chunks where no road is paved: %s", count, cleared);
+        helper.succeed();
+    }
+
+    /**
+     * RoadWeaver's PathFeature never paves a road's first 9 segments nor its last 6. A tunnel stretch over them must
+     * clear nothing there: TunnelCarver.roadFloors returns no column of those segments.
+     *
+     * @param helper the test's helper
+     */
+    @GameTest(template = HarnessSetup.TEMPLATE)
+    public static void tunnelNotClearedAtUnpavedRoadEnds(GameTestHelper helper) {
+        BlockPos a = H.area();
+        int x0 = a.getX() + 200;
+        int z = a.getZ() + 1000;
+        int n = 60;
+        List<BlockPos> middles = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            middles.add(new BlockPos(x0 + i, 100, z));
+        }
+        RoadData plain = roadThrough(middles, H.pos2dKey(middles.get(0)), H.pos2dKey(middles.get(n - 1)));
+        List<RoadSpan> spans = List.of(new RoadSpan(middles.get(0), middles.get(29), SpanType.TUNNEL),
+                new RoadSpan(middles.get(45), middles.get(n - 1), SpanType.TUNNEL));
+        RoadData road = new RoadData(plain.width(), plain.roadType(), plain.materials(), plain.slabMaterials(),
+                plain.roadSegmentList(), spans, plain.targetY(), plain.ownerA2dKey(), plain.ownerB2dKey());
+        Set<Long> cleared = TunnelCarver.roadFloors(List.of(road), Integer.MIN_VALUE / 2, Integer.MIN_VALUE / 2,
+                Integer.MAX_VALUE / 2, Integer.MAX_VALUE / 2).keySet();
+        H.check(!cleared.isEmpty(), "harness: the tunnel stretches clear nothing at all");
+        List<Integer> unpaved = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            if (i >= 9 && i < n - 6) {
+                continue;
+            }
+            for (BlockPos p : road.roadSegmentList().get(i).positions()) {
+                if (cleared.contains(CoordinateKeys.pack(p.getX(), p.getZ()))) {
+                    unpaved.add(i);
+                    break;
+                }
+            }
+        }
+        H.check(unpaved.isEmpty(), "segment(s) RoadWeaver never paves are cleared: %s", unpaved);
+        helper.succeed();
+    }
+
+    /**
+     * Road B's stretch 104..146 layout with a recorded structure on the side road's own route, where its ramp goes
+     * down toward the main road. The snapped segments (junction pieces and ramp segments) avoid structures by
+     * trimming only: every side road segment in the structure's chunk is left without columns (paves nothing) and
+     * nothing is cleared there. The ramp and junction outside it keep their columns, and the stretch is still
+     * snapped onto the main road.
+     *
+     * @param helper the test's helper
+     */
+    @GameTest(template = HarnessSetup.TEMPLATE)
+    public static void snapStretchTrimmedAtStructure(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        MiddleStretch layout = middleStretch(level);
+        int xs = layout.x0() + 100;
+        ChunkPos blocked = new ChunkPos(new BlockPos(xs, 0, layout.z() + 24));
+        H.recordStructure(blocked, List.of(blocked), level.getMinBuildHeight(), level.getMaxBuildHeight());
+        RoadSnapService.snapAllRoads(level, layout.x0(), layout.z() - 10, layout.x0() + 300, layout.z() + 90);
+        RoadData side = storedRoadOwnedBy(level, layout.sideStart(), layout.x0() - 30, layout.z() - 30,
+                layout.x0() + 330, layout.z() + 120);
+        H.check(side != null, "the side road is gone from storage after snapping");
+        List<RoadSegmentPlacement> segments = side.roadSegmentList();
+        List<RoadSegmentPlacement> before = layout.side().roadSegmentList();
+        H.check(segments.size() == before.size(), "harness: the side road was cut (%d -> %d segments)", before.size(),
+                segments.size());
+        BlockPos inside = segments.get(74 + 30).middlePos();
+        H.check(Math.abs(inside.getZ() - layout.z()) <= H.WIDTH / 2, "the stretch isn't snapped anymore (%s)",
+                inside.toShortString());
+
+        List<String> paved = new ArrayList<>();
+        List<String> keptOutside = new ArrayList<>();
+        for (int i = 0; i < segments.size(); i++) {
+            BlockPos was = before.get(i).middlePos();
+            boolean inBlocked = new ChunkPos(was).equals(blocked);
+            boolean changed = !side.targetY().get(i).equals(layout.side().targetY().get(i));
+            if (inBlocked && !isAnchor(segments.get(i)) && paved.size() < 8) {
+                paved.add(i + " " + was.toShortString());
+            }
+            if (!inBlocked && changed && !isAnchor(segments.get(i))) {
+                keptOutside.add(i + "");
+            }
+        }
+        H.check(paved.isEmpty(), "side road segment(s) still paved inside the structure: %s", paved);
+        H.check(!keptOutside.isEmpty(), "no ramp segment outside the structure kept its columns");
+        int clearedThere = 0;
+        for (long key : TunnelCarver.roadFloors(List.of(side), Integer.MIN_VALUE / 2, Integer.MIN_VALUE / 2,
+                Integer.MAX_VALUE / 2, Integer.MAX_VALUE / 2).keySet()) {
+            if (CoordinateKeys.unpackA(key) >> 4 == blocked.x && CoordinateKeys.unpackB(key) >> 4 == blocked.z) {
+                clearedThere++;
+            }
+        }
+        H.check(clearedThere == 0, "%d column(s) cleared inside the structure", clearedThere);
+        helper.succeed();
+    }
+
+    /**
+     * The x 24, z 97 layout, saved but not snapped yet.
+     *
+     * @param main      the main road, along X, 19 blocks below the surface, one segment per block
+     * @param side      the side road as saved: down along Z on the surface, then 8 blocks beside the main road
+     * @param sideStart    the side road's first owner (2D key)
+     * @param x0           the main road's first X (block)
+     * @param z            the main road's Z (block)
+     * @param pregenerated ChunkPos.asLong of the chunks generated before the roads were saved, empty if none
+     */
+    private record AcrossHeight(RoadData main, RoadData side, long sideStart, int x0, int z, Set<Long> pregenerated) {
+    }
+
+    /**
+     * Builds and saves the x 24, z 97 layout, with no chunk generated before the roads are saved.
+     *
+     * @param level the level, its road storage is changed
+     * @return the saved roads and where they lie
+     */
+    private static AcrossHeight acrossHeight(ServerLevel level) {
+        return acrossHeight(level, false);
+    }
+
+    /**
+     * Builds and saves the x 24, z 97 layout: a main road 19 blocks below the surface, and a side road on the
+     * surface that comes down along Z, then runs 8 blocks beside it along X. Both lead to the same destination, and
+     * both climb at most 1 block per segment. The main road is paved in stone bricks, the side road in gravel.
+     * <p>
+     * With {@code pregenerate}, the chunks around where the side road meets the main road (its junction) are fully
+     * generated before the roads are saved, like spawn's chunks: RoadWeaver never paves the roads there.
+     *
+     * @param level       the level, its road storage and (with pregenerate) chunks are changed
+     * @param pregenerate true to generate the junction's chunks before the roads are saved
+     * @return the saved roads and where they lie
+     */
+    private static AcrossHeight acrossHeight(ServerLevel level, boolean pregenerate) {
+        BlockPos a = dryRoute(level, new TerrainSamplingCache(), 160, 420, 1000);
+        int x0 = a.getX() + 200;
+        int z = a.getZ() + 1000;
+        int drop = 19;
+        List<BlockPos> mainMiddles = new ArrayList<>();
+        for (int x = x0; x <= x0 + 200; x++) {
+            mainMiddles.add(new BlockPos(x, H.surfaceY(level, x, z) - drop, z));
+        }
+        int xs = x0 + 60;
+        List<BlockPos> sideMiddles = new ArrayList<>();
+        for (int zz = z + 60; zz > z + 8; zz--) {
+            sideMiddles.add(new BlockPos(xs, H.surfaceY(level, xs, zz), zz));
+        }
+        for (int x = xs; x <= xs + 60; x++) {
+            sideMiddles.add(new BlockPos(x, H.surfaceY(level, x, z + 8), z + 8));
+        }
+        mainMiddles = slopeLimited(mainMiddles);
+        sideMiddles = slopeLimited(sideMiddles);
+        long dest = H.pos2dKey(new BlockPos(x0 + 200, 0, z));
+        long sideStart = H.pos2dKey(sideMiddles.get(0));
+        RoadData main = roadThrough(mainMiddles, H.pos2dKey(mainMiddles.get(0)), dest);
+        RoadData side = roadThrough(sideMiddles, sideStart, dest, Blocks.GRAVEL.defaultBlockState());
+        Set<Long> pregenerated = new HashSet<>();
+        if (pregenerate) {
+            for (int cx = (xs - 8) >> 4; cx <= (xs + 8) >> 4; cx++) {
+                for (int cz = (z - 4) >> 4; cz <= (z + 20) >> 4; cz++) {
+                    level.getChunk(cx, cz);
+                    pregenerated.add(ChunkPos.asLong(cx, cz));
+                }
+            }
+        }
+        RoadShardStorage.addRoad(level, main);
+        RoadShardStorage.addRoad(level, side);
+        return new AcrossHeight(main, side, sideStart, x0, z, pregenerated);
+    }
+
+    /**
+     * Road B's stretch 104..146 layout, saved but not snapped yet.
+     *
+     * @param side      the side road as saved
+     * @param sideStart the side road's first owner (2D key)
+     * @param x0        the main road's first X (block)
+     * @param z         the main road's Z (block)
+     * @param mainY     the main road's height
+     * @param sideY     the side road's own height
+     */
+    private record MiddleStretch(RoadData side, long sideStart, int x0, int z, int mainY, int sideY) {
+    }
+
+    /**
+     * Road B's stretch 104..146 layout after RoadWeaver's snap.
+     *
+     * @param side     the snapped side road, as stored
+     * @param runStart the first segment RoadWeaver snapped (the first whose columns moved)
+     * @param runEnd   the last segment it snapped (the last whose columns moved)
+     */
+    private record SnappedStretch(RoadData side, int runStart, int runEnd) {
+    }
+
+    /**
+     * Builds and saves road B's stretch 104..146 layout: a flat main road along X, and a flat side road 19 blocks
+     * higher that comes down along Z from 80 blocks away, runs 6 blocks beside the main road for 60 blocks, then
+     * leaves along Z again, paved in gravel (the main road in stone bricks). Different destinations, so RoadWeaver
+     * snaps it without cutting it. One segment per
+     * block, and the main road has more segments, so RoadWeaver snaps the side road onto it.
+     *
+     * @param level the level, its road storage is changed
+     * @return the saved side road, its snapped stretch and where it lies
+     */
+    private static MiddleStretch middleStretch(ServerLevel level) {
+        BlockPos a = H.area();
+        int x0 = a.getX() + 200;
+        int z = a.getZ() + 1000;
+        int mainY = 100;
+        int sideY = mainY + 19;
+        List<BlockPos> mainMiddles = new ArrayList<>();
+        for (int x = x0; x <= x0 + 300; x++) {
+            mainMiddles.add(new BlockPos(x, mainY, z));
+        }
+        int xs = x0 + 100;
+        List<BlockPos> sideMiddles = new ArrayList<>();
+        for (int zz = z + 80; zz > z + 6; zz--) {
+            sideMiddles.add(new BlockPos(xs, sideY, zz));
+        }
+        for (int x = xs; x <= xs + 60; x++) {
+            sideMiddles.add(new BlockPos(x, sideY, z + 6));
+        }
+        for (int zz = z + 7; zz <= z + 80; zz++) {
+            sideMiddles.add(new BlockPos(xs + 60, sideY, zz));
+        }
+        long sideStart = H.pos2dKey(sideMiddles.get(0));
+        RoadData side = roadThrough(sideMiddles, sideStart, H.pos2dKey(sideMiddles.get(sideMiddles.size() - 1)),
+                Blocks.GRAVEL.defaultBlockState());
+        RoadShardStorage.addRoad(level, roadThrough(mainMiddles, H.pos2dKey(mainMiddles.get(0)),
+                H.pos2dKey(mainMiddles.get(mainMiddles.size() - 1))));
+        RoadShardStorage.addRoad(level, side);
+        return new MiddleStretch(side, sideStart, x0, z, mainY, sideY);
+    }
+
+    /**
+     * Snaps road B's stretch 104..146 layout, reads the side road back and finds the stretch RoadWeaver snapped: the
+     * segments whose columns moved (a ramp only changes heights).
+     *
+     * @param level  the level
+     * @param layout the saved layout
+     * @return the snapped side road and its snapped stretch, checked to be stored, snapped once and not cut
+     */
+    private static SnappedStretch snapMiddleStretch(ServerLevel level, MiddleStretch layout) {
+        RoadSnapService.snapAllRoads(level, layout.x0(), layout.z() - 10, layout.x0() + 300, layout.z() + 90);
+        RoadData side = storedRoadOwnedBy(level, layout.sideStart(), layout.x0() - 30, layout.z() - 30,
+                layout.x0() + 330, layout.z() + 120);
+        H.check(side != null, "the side road is gone from storage after snapping");
+        List<RoadSegmentPlacement> segments = side.roadSegmentList();
+        List<RoadSegmentPlacement> before = layout.side().roadSegmentList();
+        H.check(segments.size() == before.size(), "harness: the side road was cut (%d -> %d segments)", before.size(),
+                segments.size());
+        int runStart = -1;
+        int runEnd = -1;
+        for (int i = 0; i < segments.size(); i++) {
+            if (!columnsOf(segments.get(i)).equals(columnsOf(before.get(i)))) {
+                runStart = runStart < 0 ? i : runStart;
+                runEnd = i;
+            }
+        }
+        H.check(runStart > 0 && runEnd < segments.size() - 1, "harness: RoadWeaver didn't snap the side road (moved %d..%d)",
+                runStart, runEnd);
+        int middle = (runStart + runEnd) / 2;
+        BlockPos inside = segments.get(middle).middlePos();
+        H.check(Math.abs(inside.getZ() - layout.z()) <= H.WIDTH / 2,
+                "harness: RoadWeaver didn't snap stretch %d..%d onto the main road (segment %d at %s)", runStart, runEnd,
+                middle, inside.toShortString());
+        return new SnappedStretch(side, runStart, runEnd);
+    }
+
+    /**
+     * Collects a segment's columns.
+     *
+     * @param segment the segment, not changed
+     * @return CoordinateKeys.pack(x, z) of its positions
+     */
+    private static Set<Long> columnsOf(RoadSegmentPlacement segment) {
+        Set<Long> columns = new HashSet<>();
+        for (BlockPos p : segment.positions()) {
+            columns.add(CoordinateKeys.pack(p.getX(), p.getZ()));
+        }
+        return columns;
+    }
+
+    /**
+     * Collects the chunks a road paves in.
+     *
+     * @param road the road, not changed
+     * @return ChunkPos.asLong of every chunk holding one of its columns
+     */
+    private static Set<Long> chunksOf(RoadData road) {
+        Set<Long> chunks = new HashSet<>();
+        for (RoadSegmentPlacement s : road.roadSegmentList()) {
+            for (BlockPos p : s.positions()) {
+                chunks.add(ChunkPos.asLong(p.getX() >> 4, p.getZ() >> 4));
+            }
+        }
+        return chunks;
+    }
+
+    /**
+     * Counts the recorded tunnel boxes over some chunks.
+     *
+     * @param chunks ChunkPos.asLong of the chunks, not changed
+     * @return the ints of every tunnel box clipped to each chunk, summed
+     */
+    private static int tunnelBoxInts(Set<Long> chunks) {
+        int ints = 0;
+        for (long c : chunks) {
+            ints += TunnelCarver.boxesForChunk(ChunkPos.getX(c), ChunkPos.getZ(c)).length;
+        }
+        return ints;
+    }
+
+    /**
+     * Limits a hand-made road's climb to 1 block per segment, as RoadWeaver's slope limit does for its own roads
+     * (raw surface heights can drop 10+ blocks between neighbouring columns).
+     *
+     * @param middles the road's middles, in order, not changed
+     * @return new middles, same X and Z, each Y within 1 of the previous one's and as close to its own as that allows
+     */
+    private static List<BlockPos> slopeLimited(List<BlockPos> middles) {
+        List<BlockPos> out = new ArrayList<>(middles.size());
+        int previous = middles.get(0).getY();
+        for (BlockPos m : middles) {
+            int y = Math.max(previous - 1, Math.min(previous + 1, m.getY()));
+            out.add(new BlockPos(m.getX(), y, m.getZ()));
+            previous = y;
+        }
+        return out;
+    }
+
+    /**
+     * Tells whether a column is one of a set of columns or edge-adjacent to one.
+     *
+     * @param columns CoordinateKeys.pack(x, z) of the columns, not changed
+     * @param x       the column's X (block)
+     * @param z       the column's Z (block)
+     * @return true if the column or one of its 4 neighbours is in {@code columns}
+     */
+    private static boolean touches(Set<Long> columns, int x, int z) {
+        return columns.contains(CoordinateKeys.pack(x, z)) || columns.contains(CoordinateKeys.pack(x + 1, z))
+                || columns.contains(CoordinateKeys.pack(x - 1, z)) || columns.contains(CoordinateKeys.pack(x, z + 1))
+                || columns.contains(CoordinateKeys.pack(x, z - 1));
+    }
+
+    /**
+     * Adds the paved columns of a road's segments with their floors, computed as RoadWeaver's SegmentPaver does.
+     *
+     * @param segments the road's segments, not changed
+     * @param ys       the road's saved heights, not changed
+     * @param from     the first segment index (inclusive)
+     * @param to       the last segment index (inclusive)
+     * @param floors   CoordinateKeys.pack(x, z) to the first air Y, mutated (a later segment overwrites)
+     * @return the columns added, CoordinateKeys.pack(x, z)
+     */
+    private static Set<Long> floorsOf(List<RoadSegmentPlacement> segments, int[] ys, int from, int to,
+                                      Map<Long, Integer> floors) {
+        List<BlockPos> middles = new ArrayList<>();
+        for (RoadSegmentPlacement s : segments) {
+            middles.add(s.middlePos());
+        }
+        Set<Long> columns = new HashSet<>();
+        for (int i = from; i <= to; i++) {
+            List<BlockPos> positions = segments.get(i).positions();
+            if (positions == null || positions.isEmpty()) {
+                continue;
+            }
+            int[] heights = RoadHeightInterpolator.batchInterpolate(positions, i, middles, ys);
+            for (int p = 0; p < positions.size(); p++) {
+                long key = CoordinateKeys.pack(positions.get(p).getX(), positions.get(p).getZ());
+                floors.put(key, heights[p]);
+                columns.add(key);
+            }
+        }
+        return columns;
+    }
+
+    /**
+     * Finds the first block in a column that a player can't pass.
+     *
+     * @param level the level
+     * @param x     the column's X (block)
+     * @param z     the column's Z (block)
+     * @param from  the first Y checked (inclusive)
+     * @param to    the last Y checked (inclusive)
+     * @return a description of the blocking block, null if the column is passable (leaves and logs don't count)
+     */
+    private static String firstBlocking(ServerLevel level, int x, int z, int from, int to) {
+        for (int y = from; y <= to; y++) {
+            BlockState state = level.getBlockState(new BlockPos(x, y, z));
+            if (state.blocksMotion() && !state.is(BlockTags.LEAVES) && !state.is(BlockTags.LOGS)) {
+                return x + "," + y + "," + z + " " + state.getBlock() + " (floor " + from + ", up to " + to + ")";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Spawn's case (log: 13 segments without positions in one road): two side roads to the same destination as
+     * a main road, both cut onto it by RoadWeaver's snap. The second one's unpaved lead segments then lie beside
+     * the first one's, so a later snap against the first side road would cut it a second time and "restore"
+     * its unpaved lead segments as its junction. Each side road must be cut once only: at most one anchor plus
+     * JunctionRepair's lead segments without positions, all at its end.
+     *
+     * @param helper the test's helper
+     */
+    @GameTest(template = HarnessSetup.TEMPLATE)
+    public static void snapDoesNotCutTwice(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        BlockPos a = H.area();
+        int x0 = a.getX() + 200;
+        int z = a.getZ() + 1000;
+        int y = 100;
+        long dest = H.pos2dKey(new BlockPos(x0 + 200, y, z));
+        int xA = x0 + 60;
+        List<BlockPos> aMiddles = besideRoadMiddles(xA, z, y, -1, 50);
+        List<BlockPos> bMiddles = besideRoadMiddles(xA + 14, z, y, 1, 70); // longer: RoadWeaver snaps it before A
+        long aStart = H.pos2dKey(aMiddles.get(0));
+        long bStart = H.pos2dKey(bMiddles.get(0));
+        RoadData main = H.roadAlongX(x0, x0 + 200, z, y, H.pos2dKey(new BlockPos(x0, y, z)), dest);
+        RoadShardStorage.addRoad(level, main);
+        RoadShardStorage.addRoad(level, roadThrough(aMiddles, aStart, dest));
+        RoadShardStorage.addRoad(level, roadThrough(bMiddles, bStart, dest));
+        RoadSnapService.snapAllRoads(level, x0, z - 70, x0 + 200, z + 70);
+
+        Set<BlockPos> mainMiddles = new HashSet<>();
+        for (RoadSegmentPlacement s : main.roadSegmentList()) {
+            mainMiddles.add(s.middlePos());
+        }
+        List<String> problems = new ArrayList<>();
+        for (long owner : new long[]{bStart, aStart}) {
+            RoadData road = storedRoadOwnedBy(level, owner, x0 - 30, z - 100, x0 + 230, z + 100);
+            H.check(road != null, "a side road is gone from storage after snapping");
+            List<RoadSegmentPlacement> segments = road.roadSegmentList();
+            String name = owner == aStart ? "side road A" : "side road B";
+            H.check(isAnchor(segments.get(segments.size() - 1)), "harness: %s wasn't cut at its shared end", name);
+            List<String> tail = new ArrayList<>();
+            for (int i = Math.max(0, segments.size() - 16); i < segments.size(); i++) {
+                tail.add(i + " " + segments.get(i).middlePos().toShortString() + (isAnchor(segments.get(i)) ? " -" : " +"));
+            }
+            H.log("{} end after snapping (+ paved, - no positions): {}", name, tail);
+            int trailing = 0;
+            while (trailing < segments.size() && isAnchor(segments.get(segments.size() - 1 - trailing))) {
+                trailing++;
+            }
+            int total = (int) segments.stream().filter(RoadWeaverHarness::isAnchor).count();
+            BlockPos anchor = segments.get(segments.size() - 1).middlePos();
+            if (!mainMiddles.contains(anchor) || total != trailing) {
+                problems.add(name + ": anchor " + anchor.toShortString() + (mainMiddles.contains(anchor) ? " on" : " not on")
+                        + " the main road, " + trailing + " segments without positions at its end, " + total + " in all");
+            }
+        }
+        H.check(problems.isEmpty(), "a side road was cut more than once: %s", problems);
+        helper.succeed();
+    }
+
+    /**
+     * Builds a side road's middles beside a main road along X: along Z toward the main road, then 8 blocks
+     * beside it (along X) for 30 blocks.
+     *
+     * @param x       the side road's X (block)
+     * @param z       the main road's Z (block)
+     * @param y       the middles' Y
+     * @param side    1 for the +Z side of the main road, -1 for the -Z side
+     * @param descent how far from the main road the side road starts (blocks along Z)
+     * @return the middles, every 2 blocks
+     */
+    private static List<BlockPos> besideRoadMiddles(int x, int z, int y, int side, int descent) {
+        List<BlockPos> middles = new ArrayList<>();
+        for (int d = descent; d > 8; d -= 2) {
+            middles.add(new BlockPos(x, y, z + side * d));
+        }
+        for (int xx = x; xx <= x + 30; xx += 2) {
+            middles.add(new BlockPos(xx, y, z + side * 8));
+        }
+        return middles;
+    }
+
+    /**
      * Builds the side road's middles: down along Z at x from z + 60, then 8 blocks beside the main road
      * (along X) for 30 blocks.
      *
@@ -1316,6 +2264,19 @@ public final class RoadWeaverHarness {
      * @return the road, not saved
      */
     private static RoadData roadThrough(List<BlockPos> middles, long ownerA, long ownerB) {
+        return roadThrough(middles, ownerA, ownerB, Blocks.STONE_BRICKS.defaultBlockState());
+    }
+
+    /**
+     * Builds a road through the given middles, H.WIDTH columns across its local direction, paved in one material.
+     *
+     * @param middles  the segment middles, their Y is the road height
+     * @param ownerA   one destination (2D key)
+     * @param ownerB   the other destination (2D key)
+     * @param material the road's only material
+     * @return the road, not saved
+     */
+    private static RoadData roadThrough(List<BlockPos> middles, long ownerA, long ownerB, BlockState material) {
         List<RoadSegmentPlacement> segments = new ArrayList<>();
         List<Integer> ys = new ArrayList<>();
         int half = H.WIDTH / 2;
@@ -1331,8 +2292,7 @@ public final class RoadWeaverHarness {
             segments.add(new RoadSegmentPlacement(m, positions));
             ys.add(m.getY());
         }
-        return new RoadData(H.WIDTH, 0, List.of(Blocks.STONE_BRICKS.defaultBlockState()), List.of(), segments,
-                List.of(), ys, ownerA, ownerB);
+        return new RoadData(H.WIDTH, 0, List.of(material), List.of(), segments, List.of(), ys, ownerA, ownerB);
     }
 
     /**
@@ -1498,7 +2458,7 @@ public final class RoadWeaverHarness {
     }
 
     /**
-     * A run inside a no-road zone is trimmed at the zone's edge, never tunnelled under it.
+     * A blocked stretch inside a no-road zone is trimmed at the zone's edge, never tunnelled under it.
      *
      * @param helper the test's helper
      */
@@ -1521,7 +2481,7 @@ public final class RoadWeaverHarness {
                 TunnelPlan plan = RoadTunnelPlanner.planFor(segments);
                 H.check(plan != null, "no plan for a road crossing a no-road zone");
                 H.check(plan.tunnelBoxes.isEmpty(), "a tunnel was planned under a no-road zone");
-                H.check(plan.parts.size() == 2, "expected the run in the zone trimmed (2 parts), got %d", plan.parts.size());
+                H.check(plan.parts.size() == 2, "expected the blocked stretch in the zone trimmed (2 parts), got %d", plan.parts.size());
                 for (RoadSegmentPlacement s : plan.keptSegments) {
                     for (BlockPos p : columns(s)) {
                         H.check(!zone.contains(p.getX(), p.getZ(), 0), "a kept road column %s lies in the zone",
@@ -1673,7 +2633,7 @@ public final class RoadWeaverHarness {
     }
 
     /**
-     * A run under a shallow structure is dug below it, with ramps within the slope limit and a TUNNEL span.
+     * A blocked stretch under a shallow structure is dug below it, with ramps within the slope limit and a tunnel stretch.
      *
      * @param helper the test's helper
      */
@@ -1688,12 +2648,12 @@ public final class RoadWeaverHarness {
             int step2 = t.slopeStep();
             H.check(!t.blocked.isEmpty(), "harness: no segment crosses the structure");
             if (step2 <= 0) {
-                H.check(plan != null && plan.parts.size() == 2, "slope limit 0: the run should be trimmed");
+                H.check(plan != null && plan.parts.size() == 2, "slope limit 0: the blocked stretch should be trimmed");
                 helper.succeed();
                 return;
             }
             H.check(plan != null, "no plan for a road crossing a structure");
-            H.check(plan.parts.size() == 1 && out.size() == t.segments.size(), "a diggable run was trimmed (%d parts)",
+            H.check(plan.parts.size() == 1 && out.size() == t.segments.size(), "a diggable blocked stretch was trimmed (%d parts)",
                     plan.parts.size());
             int ceiling = 98 - clear - 2;
             for (int i : t.blocked) {
@@ -1704,7 +2664,7 @@ public final class RoadWeaverHarness {
                         i, i + 2, step2, out);
             }
             H.check(out.get(0) == 100 && out.get(out.size() - 1) == 100, "road ends moved: %s", out);
-            H.check(plan.keptSpans.stream().anyMatch(s -> s.type() == SpanType.TUNNEL), "no TUNNEL span");
+            H.check(plan.keptSpans.stream().anyMatch(s -> s.type() == SpanType.TUNNEL), "no tunnel stretch");
             H.check(!plan.tunnelBoxes.isEmpty(), "no tunnel dig volume");
             for (int[] box : plan.tunnelBoxes) {
                 H.check(box[5] == box[4] + clear && box[4] < 100, "tunnel box %s", Arrays.toString(box));
@@ -1717,7 +2677,7 @@ public final class RoadWeaverHarness {
     }
 
     /**
-     * A run under a structure reaching too deep is trimmed, the road split in two parts.
+     * A blocked stretch under a structure reaching too deep is trimmed, the road split in two parts.
      *
      * @param helper the test's helper
      */
@@ -1733,7 +2693,7 @@ public final class RoadWeaverHarness {
             H.check(plan.keptSegments.size() == t.segments.size() - t.blocked.size(),
                     "kept %d segments, expected %d", plan.keptSegments.size(), t.segments.size() - t.blocked.size());
             H.check(out.size() == plan.keptSegments.size(), "heights not aligned with kept segments");
-            H.check(plan.tunnelBoxes.isEmpty(), "a too-deep run was dug");
+            H.check(plan.tunnelBoxes.isEmpty(), "a too-deep blocked stretch was dug");
             H.check(plan.reachesEnd, "last part should reach the road end");
             for (int i : t.blocked) {
                 H.check(!plan.keptSegments.contains(t.segments.get(i)), "blocked segment %d was kept", i);
@@ -1790,7 +2750,7 @@ public final class RoadWeaverHarness {
     }
 
     /**
-     * A run inside a water crossing (BRIDGE span) is trimmed, never dug: the tunnel would flood.
+     * A blocked stretch inside a water crossing (bridge stretch) is trimmed, never dug: the tunnel would flood.
      *
      * @param helper the test's helper
      */
@@ -1802,9 +2762,9 @@ public final class RoadWeaverHarness {
             RoadTunnelPlanner.plan(t.level, t.connection, t.segments, List.of(bridge), t.targetY, t.cfg);
             TunnelPlan plan = RoadTunnelPlanner.planFor(t.segments);
             H.check(plan != null && plan.tunnelBoxes.isEmpty() && plan.parts.size() == 2,
-                    "a run under a water crossing was dug (boxes %s, parts %s)",
+                    "a blocked stretch under a water crossing was dug (boxes %s, parts %s)",
                     plan == null ? "-" : plan.tunnelBoxes.size(), plan == null ? "-" : plan.parts.size());
-            H.check(plan.keptSpans.stream().noneMatch(s -> s.type() == SpanType.TUNNEL), "a TUNNEL span over water");
+            H.check(plan.keptSpans.stream().noneMatch(s -> s.type() == SpanType.TUNNEL), "a tunnel stretch over water");
         } finally {
             RoadTunnelPlanner.clearPlan();
         }
@@ -1979,7 +2939,7 @@ public final class RoadWeaverHarness {
         H.check(road != null, "generateRoad returned no road");
         boolean[] tunnel = TunnelCarver.getTunnelSegmentsByRoadData(road);
         H.check(tunnel != null, "no tunnel was planned through the ring (crossed ring chunks from y %d, ground %d..%d), "
-                        + "returned road: %d segments, spans %s, y %d..%d", ringMin + 2, ringMin, ringMax,
+                        + "returned road: %d segments, tunnel and bridge stretches %s, y %d..%d", ringMin + 2, ringMin, ringMax,
                 road.roadSegmentList().size(), road.spans().stream().map(s -> s.type() + "@" + s.start().toShortString()).toList(),
                 road.targetY().stream().mapToInt(Integer::intValue).min().orElse(0),
                 road.targetY().stream().mapToInt(Integer::intValue).max().orElse(0));
@@ -2002,7 +2962,7 @@ public final class RoadWeaverHarness {
 
         /*
             Inside: every road column of the tunnel RWSA dug, from the paved road's first air block up to the
-            clearance. Columns of a TUNNEL span outside RWSA's tunnel boxes are RoadWeaver's own tunnels (kept
+            clearance. Columns of a tunnel stretch outside RWSA's tunnel boxes are RoadWeaver's own tunnels (kept
             spans), which RoadWeaver digs and paves itself only where it paves, so they aren't checked here.
          */
         int clear = RoadWeaverAccessor.roadClearHeight();
@@ -2033,10 +2993,10 @@ public final class RoadWeaverHarness {
                 }
             }
         }
-        H.check(checked > 0, "none of the %d TUNNEL span road columns lies in RWSA's tunnel boxes", floors.size());
+        H.check(checked > 0, "none of the %d tunnel stretch road columns lies in RWSA's tunnel boxes", floors.size());
         H.check(solid == 0, "%d solid blocks inside the tunnel over %d road columns: %s", solid, checked, samples);
         if (roadWeaverOwn > 0) {
-            H.log("tunnel worldgen: {} road columns of RoadWeaver's own TUNNEL spans skipped", roadWeaverOwn);
+            H.log("tunnel worldgen: {} road columns of RoadWeaver's own tunnel stretches skipped", roadWeaverOwn);
         }
 
         // No lamps, posts or signs over the inner tunnel (ramp ends excluded: lamps of the open road may stand there).
@@ -2150,8 +3110,13 @@ public final class RoadWeaverHarness {
         int floor = 100;
         int clear = TunnelCarver.clearHeight();
         int margin = H.MARGIN;
-        RoadShardStorage.addRoad(level, H.tunnelRoadAlongX(x0, x0 + 8, z, floor));
-        TunnelStore.add(new int[]{x0 - margin, z - 1 - margin, x0 + 8 + margin, z + 1 + margin, floor, floor + clear});
+        /*
+            Long enough for x0 .. x0 + 8 to lie in the segments PathFeature paves (not its first 9 nor its last 6,
+            one segment every 2 blocks): RoadWeaver never paves a road's ends, so they are never cleared.
+         */
+        RoadShardStorage.addRoad(level, H.tunnelRoadAlongX(x0 - 30, x0 + 40, z, floor));
+        TunnelStore.add(new int[]{x0 - 30 - margin, z - 1 - margin, x0 + 40 + margin, z + 1 + margin, floor,
+                floor + clear});
         ChunkPos chunk = new ChunkPos(x0 >> 4, z0 >> 4);
         H.check(TunnelCarver.boxesForChunk(chunk.x, chunk.z).length > 0, "harness: no tunnel box in the chunk");
         int roadX = x0 + 4;

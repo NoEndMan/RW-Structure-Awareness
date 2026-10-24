@@ -11,7 +11,7 @@ import java.util.Map;
 
 /**
  * A road changed by RoadTunnelPlanner and RoadTrimPlanner together: the tunnel results (the new heights,
- * TUNNEL spans and dig volumes) and the trim results (the kept segments, in order, split into parts at every
+ * tunnel stretches and dig volumes) and the trim results (the kept segments, in order, split into parts at every
  * trimmed gap). RoadMixin applies it to the RoadData RoadWeaver builds.
  */
 public final class TunnelPlan {
@@ -34,7 +34,7 @@ public final class TunnelPlan {
      *
      * @param originalSegments the segment list the plan was computed for, kept by identity
      * @param keptSegments     the kept segments, in road order
-     * @param keptSpans        the spans to save, TUNNEL spans included
+     * @param keptSpans        the tunnel and bridge stretches to save, the new tunnel stretches included
      * @param keptTargetY      the new height of each kept segment (first air Y above the road)
      * @param parts            [fromIndex, toIndex) ranges into the kept lists, one per road piece
      * @param tunnelBoxes      dig volumes, TunnelStore.BOX_INTS ints each
@@ -51,7 +51,7 @@ public final class TunnelPlan {
      *
      * @param originalSegments the segment list the plan was computed for, kept by identity
      * @param keptSegments     the kept segments, in road order
-     * @param keptSpans        the spans to save, TUNNEL spans included
+     * @param keptSpans        the tunnel and bridge stretches to save, the new tunnel stretches included
      * @param keptTargetY      the new height of each kept segment (first air Y above the road)
      * @param parts            [fromIndex, toIndex) ranges into the kept lists, one per road piece
      * @param tunnelBoxes      dig volumes, TunnelStore.BOX_INTS ints each
@@ -82,10 +82,10 @@ public final class TunnelPlan {
     }
 
     /**
-     * Returns the spans starting in one road piece.
+     * Returns the tunnel and bridge stretches starting in one road piece.
      *
      * @param part the piece's index in parts
-     * @return the kept spans whose start lies in that piece, a new list
+     * @return the kept stretches whose start lies in that piece, a new list
      */
     public List<RoadSpan> spansOfPart(int part) {
         int[] range = parts.get(part);

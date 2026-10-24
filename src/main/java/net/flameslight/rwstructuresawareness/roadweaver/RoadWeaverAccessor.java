@@ -4,6 +4,7 @@ import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import net.flameslight.rwstructuresawareness.logger.ModLogger;
 import net.flameslight.rwstructuresawareness.logger.RoadDebug;
 import net.flameslight.rwstructuresawareness.RoadInsideRegionChunksRecorder;
+import net.flameslight.rwstructuresawareness.road.SnapJunctionShaper;
 import net.flameslight.rwstructuresawareness.tunnel.TunnelCarver;
 import net.flameslight.rwstructuresawareness.types.road.RoadColumns;
 import net.flameslight.rwstructuresawareness.utils.CoordinateKeys;
@@ -22,6 +23,8 @@ import java.util.List;
 
 /** RoadWeaver storage and config access, and RoadData conversion. */
 public final class RoadWeaverAccessor {
+    /** Height step allowed per two segments when RoadWeaver's slope limit is disabled (its configurable maximum). */
+    public static final int UNLIMITED_SLOPE_STEP = 8;
     private static final int DEFAULT_CLEAR_HEIGHT = 4;
     private static final int DEFAULT_SLOPE_STEP = 2;
 
@@ -64,7 +67,8 @@ public final class RoadWeaverAccessor {
     }
 
     /**
-     * Updates RWSA's road maps after RoadFileStorage.replaceRoad or deleteRoad returned.
+     * Updates RWSA's road maps after RoadFileStorage.replaceRoad or deleteRoad returned, and records the tunnel boxes
+     * of the tunnel stretches the replacing road newly has (a snapped road's cleared junctions).
      *
      * @param level   the level, may be null (then nothing happens)
      * @param oldRoad the road as read before the call, null if unknown (every loaded region is refreshed)
@@ -75,6 +79,7 @@ public final class RoadWeaverAccessor {
             return;
         }
         try {
+            SnapJunctionShaper.recordNewTunnelBoxes(oldRoad, newRoad);
             RoadInsideRegionChunksRecorder.onRoadReplaced(level, oldRoad == null ? null : toColumns(oldRoad),
                     newRoad == null ? null : toColumns(newRoad));
             TunnelCarver.invalidateFloors(oldRoad); // null (unknown) drops every cached chunk
@@ -170,6 +175,16 @@ public final class RoadWeaverAccessor {
     public static int maxSlopeStepPerTwoSegments() {
         ModConfig config = ConfigService.get();
         return config == null ? DEFAULT_SLOPE_STEP : Math.max(0, Math.min(8, config.maxSlopeStepPerTwoSegments()));
+    }
+
+    /**
+     * Tells whether RoadWeaver limits its roads' slope.
+     *
+     * @return RoadWeaver's slopeLimitEnabled setting, true while its config isn't loaded
+     */
+    public static boolean slopeLimitEnabled() {
+        ModConfig config = ConfigService.get();
+        return config == null || config.slopeLimitEnabled();
     }
 
     /**

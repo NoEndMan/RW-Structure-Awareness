@@ -12,6 +12,7 @@ import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.WorldGenLevel;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.levelgen.feature.FeaturePlaceContext;
 import net.shiroha233.roadweaver.config.ModConfig;
 import net.shiroha233.roadweaver.core.model.RoadData;
@@ -30,7 +31,8 @@ import java.util.Set;
 
 /**
  * RoadWeaver's road feature (runs last in a chunk's decoration, top_layer_modification):
- *  - after it paved the chunk, the road tunnels there (and in already-decorated neighbours) are carved.
+ *  - every segment it paves is noted, and after it paved the chunk, the TUNNEL segments it paved are cleared and
+ *    then, the tunnels there (and in already-decorated neighbours) are cleared again where the road is paved.
  *  - lamps, posts and signs are not planned on tunnel stretches (they'd stand on the ground above), on
  *    positionless segments, nor as the end sign of a road end RoadWeaver's snap truncated.
  *
@@ -40,7 +42,8 @@ import java.util.Set;
 @Mixin(value = PathFeature.class, remap = false)
 public abstract class PathFeatureMixin {
     /**
-     * At PathFeature.place HEAD: counts the paving for the debug log.
+     * At PathFeature.place HEAD: counts the paving for the debug log, and forgets the paved segments noted for the
+     * previous chunk.
      *
      * @param context the feature context
      * @param cir     place's return
@@ -49,6 +52,35 @@ public abstract class PathFeatureMixin {
     private void rwstructuresawareness$countPaving(FeaturePlaceContext<PathFeatureConfig> context,
                                                    CallbackInfoReturnable<Boolean> cir) {
         RoadDebug.pavingStarted();
+        TunnelCarver.pavingStarted();
+    }
+
+    /**
+     * Wraps processRoadDataInChunk's SegmentPaver.paveSegment: after RoadWeaver paved a segment, notes it, so a
+     * TUNNEL segment is cleared at the end of the chunk (TunnelCarver.carveAround) exactly when RoadWeaver paved it.
+     *
+     * @param level         the WorldGenRegion
+     * @param segment       the segment being paved
+     * @param index         its index in the road
+     * @param middles       the road's segment middles
+     * @param ys            the heights RoadWeaver paves with
+     * @param width         the road width
+     * @param materials     the road materials
+     * @param slabMaterials the slab materials
+     * @param random        the random source
+     * @param cfg           RoadWeaver's config
+     * @param original      paveSegment
+     * @param road          the road being processed
+     */
+    @WrapOperation(method = "processRoadDataInChunk", at = @At(value = "INVOKE",
+            target = "Lnet/shiroha233/roadweaver/features/path/pathlogic/core/SegmentPaver;paveSegment(Lnet/minecraft/world/level/WorldGenLevel;Lnet/shiroha233/roadweaver/core/model/RoadSegmentPlacement;ILjava/util/List;[IILjava/util/List;Ljava/util/List;Lnet/minecraft/util/RandomSource;Lnet/shiroha233/roadweaver/config/ModConfig;)V"))
+    private static void rwstructuresawareness$notePaved(WorldGenLevel level, RoadSegmentPlacement segment, int index,
+                                                        List<BlockPos> middles, int[] ys, int width,
+                                                        List<BlockState> materials, List<BlockState> slabMaterials,
+                                                        RandomSource random, ModConfig cfg, Operation<Void> original,
+                                                        @Local(argsOnly = true) RoadData road) {
+        original.call(level, segment, index, middles, ys, width, materials, slabMaterials, random, cfg);
+        TunnelCarver.notePaved(road, index, middles, ys);
     }
 
     /**
@@ -151,7 +183,7 @@ public abstract class PathFeatureMixin {
      * @param road            the road, may be null
      * @param middlePositions the road's segment middles, may be null
      * @param anchor          the decoration's anchor, may be null
-     * @return true if the anchor's segment lies in a TUNNEL span
+     * @return true if the anchor's segment lies in a tunnel stretch
      */
     private static boolean inTunnel(RoadData road, List<BlockPos> middlePositions, BlockPos anchor) {
         boolean[] tunnel = TunnelCarver.getTunnelSegmentsByRoadData(road);

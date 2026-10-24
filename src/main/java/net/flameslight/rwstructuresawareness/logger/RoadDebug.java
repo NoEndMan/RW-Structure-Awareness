@@ -3,6 +3,7 @@ package net.flameslight.rwstructuresawareness.logger;
 import it.unimi.dsi.fastutil.longs.LongLinkedOpenHashSet;
 import net.flameslight.rwstructuresawareness.config.CommonConfig;
 import net.flameslight.rwstructuresawareness.mixins.ChunkMapAccessor;
+import net.flameslight.rwstructuresawareness.types.road.RoadLevel;
 import net.flameslight.rwstructuresawareness.utils.CoordinateKeys;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.level.ChunkHolder;
@@ -300,13 +301,10 @@ public final class RoadDebug {
                 chunks.add(ChunkPos.asLong(m.getX() >> 4, m.getZ() >> 4));
             }
         }
-        ChunkMapAccessor map = (ChunkMapAccessor) level.getChunkSource().chunkMap;
         List<String> listed = new ArrayList<>();
         int decorated = 0;
         for (long key : chunks) {
-            ChunkHolder holder = map.rwstructuresawareness$getVisibleChunkIfPresent(key);
-            ChunkAccess chunk = holder == null ? null : holder.getLastAvailable();
-            if (chunk != null && chunk.getStatus().isOrAfter(ChunkStatus.FEATURES)) {
+            if (RoadLevel.isDecorated(level, ChunkPos.getX(key), ChunkPos.getZ(key))) {
                 decorated++;
                 if (listed.size() < MAX_LISTED_CHUNKS) {
                     listed.add("[" + ChunkPos.getX(key) + ", " + ChunkPos.getZ(key) + "]");

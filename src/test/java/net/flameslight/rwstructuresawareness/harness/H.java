@@ -106,7 +106,7 @@ final class H {
     }
 
     /**
-     * Builds roadAlongX with one TUNNEL span over the whole road (as RoadTunnelPlanner saves a dug stretch).
+     * Builds roadAlongX with one tunnel stretch over the whole road (as RoadTunnelPlanner saves a dug stretch).
      *
      * @param x0 the first segment's X (block)
      * @param x1 the last X a segment may have (block)

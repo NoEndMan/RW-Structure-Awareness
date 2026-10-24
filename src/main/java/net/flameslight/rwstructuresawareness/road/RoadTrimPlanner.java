@@ -15,8 +15,8 @@ import java.util.Map;
 
 /**
  * The last fallback for a road that still crosses recorded structures. A road is first rerouted around them
- * (RoadRerouter), then tunnelled under them (RoadTunnelPlanner). The runs of blocked segments that can't be
- * tunnelled (too deep, below the world, no room for the ramps, over water, on the road's own destination or
+ * (RoadRerouter), then tunnelled under them (RoadTunnelPlanner). The blocked stretches (consecutive blocked
+ * segments) that can't be tunnelled (too deep, below the world, no room for the ramps, over water, on the road's own destination or
  * in a no-road zone) are trimmed here: their segments are removed, so the road stops before the structures and
  * continues after them. The remaining pieces become separate roads (RoadMixin saves them), so RoadWeaver never
  * paves or shapes terrain in between.
@@ -28,9 +28,9 @@ public final class RoadTrimPlanner {
      * Builds the road kept after trimming.
      *
      * @param segments  the road's segments, not changed
-     * @param spans     the road's spans, not changed, may be null
+     * @param spans     the road's tunnel and bridge stretches, not changed, may be null
      * @param newY      the planned height of every segment (tunnelled stretches already lowered), not changed
-     * @param trimmed   per segment, true if it lies in a run that can't be tunnelled, not changed
+     * @param trimmed   per segment, true if it lies in a blocked stretch that can't be tunnelled, not changed
      * @param obstacles the road's obstacles
      * @param from      the road's start, for the log
      * @param to        the road's end, for the log
@@ -66,7 +66,7 @@ public final class RoadTrimPlanner {
         }
 
         if (keptSegments.isEmpty()) {
-            // Every segment was trimmed, so every run is a trimmed run.
+            // Every segment was trimmed, so every stretch is a trimmed stretch.
             boolean allOnDestinations = true;
             for (int[] run : runsOf(trimmed)) {
                 allOnDestinations &= obstacles.touchesDestination(segments, run[0], run[1])
@@ -92,12 +92,12 @@ public final class RoadTrimPlanner {
     }
 
     /**
-     * Drops the spans touching a trimmed segment.
+     * Drops the tunnel and bridge stretches touching a trimmed segment.
      *
      * @param segments the road's segments, not changed
-     * @param spans    the road's spans, not changed, may be null
+     * @param spans    the road's tunnel and bridge stretches, not changed, may be null
      * @param trimmed  per segment, true if trimmed, not changed
-     * @return a new list of the spans kept. A span whose ends aren't segment middles is kept
+     * @return a new list of the stretches kept. A stretch whose ends aren't segment middles is kept
      */
     private static List<RoadSpan> spansWithoutTrimmed(List<RoadSegmentPlacement> segments,
                                                       @Nullable List<RoadSpan> spans, boolean[] trimmed) {
@@ -120,10 +120,10 @@ public final class RoadTrimPlanner {
     }
 
     /**
-     * Lists the runs of consecutive trimmed segments.
+     * Lists the trimmed stretches: groups of consecutive trimmed segments.
      *
      * @param trimmed per segment, true if trimmed, not changed
-     * @return {first, last} segment index per run, in road order
+     * @return {first, last} segment index per trimmed stretch, in road order
      */
     private static List<int[]> runsOf(boolean[] trimmed) {
         List<int[]> runs = new ArrayList<>();
@@ -142,7 +142,7 @@ public final class RoadTrimPlanner {
     }
 
     /**
-     * Logs every trimmed run (debug).
+     * Logs every trimmed stretch (debug).
      *
      * @param trimmed per segment, true if trimmed, not changed
      * @param from    the road's start

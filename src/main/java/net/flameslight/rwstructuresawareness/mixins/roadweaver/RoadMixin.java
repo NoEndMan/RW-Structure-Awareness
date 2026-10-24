@@ -35,7 +35,7 @@ import java.util.List;
  *  - a cached coarse path crossing structures is dropped, so the road is searched again (rerouted).
  *  - computeTargetY's heights go through RoadTunnelPlanner, which tunnels under the structures the final
  *    path still crosses, and RoadTrimPlanner, which cuts the road where no tunnel can be dug.
- *  - the RoadData built and the roadside precomputers then get the planned segments and spans
+ *  - the RoadData built and the roadside precomputers then get the planned segments and tunnel/bridge stretches
  *    (the precomputers see tunnels as bridges, which they already skip).
  * This class only hooks into RoadWeaver. The planners decide what changes.
  */
@@ -74,7 +74,7 @@ public abstract class RoadMixin {
      *
      * @param serverLevel the level
      * @param segments    the road's segments
-     * @param spans       the road's spans
+     * @param spans       the road's tunnel and bridge stretches
      * @param cache       RoadWeaver's terrain cache
      * @param cfg         RoadWeaver's generation config
      * @param original    Road.computeTargetY
@@ -91,15 +91,15 @@ public abstract class RoadMixin {
     }
 
     /**
-     * Wraps generateRoad's new RoadData: the road gets the plan's kept segments, spans and heights, its
-     * tunnel boxes are recorded, and every later piece is saved as a road of its own.
+     * Wraps generateRoad's new RoadData: the road gets the plan's kept segments, tunnel and bridge stretches and
+     * heights, its tunnel boxes are recorded, and every later piece is saved as a road of its own.
      *
      * @param width         the road width
      * @param roadType      RoadWeaver's road type
      * @param materials     the road materials
      * @param slabMaterials the slab materials
      * @param segments      the road's segments
-     * @param spans         the road's spans
+     * @param spans         the road's tunnel and bridge stretches
      * @param targetY       the road's heights
      * @param ownerA        one destination (2D key)
      * @param ownerB        the other destination (2D key)
@@ -187,7 +187,7 @@ public abstract class RoadMixin {
      *
      * @param serverLevel the level
      * @param segments    the road's segments
-     * @param spans       the road's spans
+     * @param spans       the road's tunnel and bridge stretches
      * @param width       the road width
      * @param cache       RoadWeaver's terrain cache
      * @param random      the random source
@@ -218,7 +218,7 @@ public abstract class RoadMixin {
      *
      * @param serverLevel the level
      * @param segments    the road's segments
-     * @param spans       the road's spans
+     * @param spans       the road's tunnel and bridge stretches
      * @param width       the road width
      * @param cache       RoadWeaver's terrain cache
      * @param terrain     RoadWeaver's terrain field

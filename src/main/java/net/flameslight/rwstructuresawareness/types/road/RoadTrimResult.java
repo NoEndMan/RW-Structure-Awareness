@@ -12,7 +12,7 @@ import java.util.List;
  * @param keptSegments the kept segments, in road order, empty when dropped or unchanged
  * @param keptTargetY  the planned height of each kept segment (first air Y above the road)
  * @param parts        [fromIndex, toIndex) ranges into the kept lists, one per road piece
- * @param keptSpans    the road's spans minus those touching a trimmed segment
+ * @param keptSpans    the road's tunnel and bridge stretches minus those touching a trimmed segment
  * @param reachesEnd   true if the road's last segment was kept
  * @param dropped      true if the road lies entirely on its own destination or a no-road zone: it isn't built
  * @param unchanged    true if the road lies entirely on other structures: it is left as RoadWeaver planned it

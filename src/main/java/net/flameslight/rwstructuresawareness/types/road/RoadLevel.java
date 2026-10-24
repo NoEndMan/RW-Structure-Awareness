@@ -1,9 +1,14 @@
 package net.flameslight.rwstructuresawareness.types.road;
 
 import net.flameslight.rwstructuresawareness.RWStructuresAwareness;
+import net.flameslight.rwstructuresawareness.mixins.ChunkMapAccessor;
+import net.minecraft.server.level.ChunkHolder;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkGenerator;
+import net.minecraft.world.level.chunk.ChunkStatus;
 import net.minecraft.world.level.storage.LevelResource;
 import org.jetbrains.annotations.Nullable;
 
@@ -62,6 +67,25 @@ public final class RoadLevel {
      */
     public static boolean isRoadLevel(@Nullable Level candidate) {
         return candidate != null && candidate == level;
+    }
+
+    /**
+     * Tells whether a loaded chunk already reached its decoration step (FEATURES): RoadWeaver won't pave a road
+     * saved from now on there anymore. Chunks generated earlier but unloaded now aren't seen.
+     *
+     * @param serverLevel the level, may be null (then false)
+     * @param chunkX      the chunk's X (chunk coordinates)
+     * @param chunkZ      the chunk's Z (chunk coordinates)
+     * @return true if the chunk is loaded and at FEATURES or later
+     */
+    public static boolean isDecorated(@Nullable ServerLevel serverLevel, int chunkX, int chunkZ) {
+        if (serverLevel == null) {
+            return false;
+        }
+        ChunkHolder holder = ((ChunkMapAccessor) serverLevel.getChunkSource().chunkMap)
+                .rwstructuresawareness$getVisibleChunkIfPresent(ChunkPos.asLong(chunkX, chunkZ));
+        ChunkAccess chunk = holder == null ? null : holder.getLastAvailable();
+        return chunk != null && chunk.getStatus().isOrAfter(ChunkStatus.FEATURES);
     }
 
     /**

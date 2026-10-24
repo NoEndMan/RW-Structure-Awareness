@@ -28,10 +28,10 @@ import java.util.Set;
 
 /**
  * Underground fallback for a finished RoadWeaver path that still crosses recorded structures (a
- * failed search, a search area too narrow for a detour, or a kept coarse path). Each contiguous run
- * of blocked segments is dug when it can be: the run drops to below the structures' lowest Y, with
- * ramps inside the allowed segments before and after it (RoadWeaver's own slope limit), marked as a
- * TUNNEL span, and its dig segment recorded in TunnelStore.
+ * failed search, a search area too narrow for a detour, or a kept coarse path). Each blocked stretch
+ * (consecutive blocked segments, {first, last} segment index) is dug when it can be: it drops to below
+ * the structures' lowest Y, with ramps inside the allowed segments before and after it (RoadWeaver's own slope limit), marked as a
+ * tunnel stretch, and its dig segment recorded in TunnelStore.
  * <p>
  * A road segment that can't be dug (too deep, below the world, no room for the ramps, over water, on the road's
  * own destination, whose edge is where the road ends, or in a no-road zone) is handed to RoadTrimPlanner,
@@ -41,12 +41,10 @@ import java.util.Set;
  * RoadData RoadWeaver builds and to its roadside precomputers (see RoadMixin).
  */
 public final class RoadTunnelPlanner {
-    /** A run is trimmed instead of dug when its floor would be more than this far below the road. */
+    /** A blocked stretch is trimmed instead of dug when its floor would be more than this far below the road. */
     private static final int MAX_TUNNEL_DEPTH = 48;
     /** Gap kept between the tunnel's ceiling and the structure above it. */
     private static final int CEILING_GAP = 2;
-    /** Height step allowed per two segments when RoadWeaver's slope limit is disabled. */
-    private static final int UNLIMITED_SLOPE_STEP = 8;
 
     private static final ThreadLocal<TunnelPlan> PLAN = new ThreadLocal<>();
 
@@ -68,14 +66,14 @@ public final class RoadTunnelPlanner {
     }
 
     /**
-     * Returns the spans plus a BRIDGE copy of every TUNNEL span.
+     * Returns the tunnel and bridge stretches plus a bridge copy of every tunnel stretch.
      * <p>
      * Only for RoadWeaver's roadside structure and village precomputers, which skip BRIDGE stretches but know
      * nothing of tunnels: nothing gets placed beside a road that runs underground. The saved road keeps its
-     * real TUNNEL spans.
+     * real tunnel stretches.
      *
-     * @param spans the road's spans, not changed
-     * @return a new list: every span, then one BRIDGE span per TUNNEL span
+     * @param spans the road's tunnel and bridge stretches, not changed
+     * @return a new list: every stretch, then one bridge stretch per tunnel stretch
      */
     public static List<RoadSpan> tunnelsAsBridges(List<RoadSpan> spans) {
         List<RoadSpan> out = new ArrayList<>(spans);
@@ -96,7 +94,7 @@ public final class RoadTunnelPlanner {
      * @param level      the level the road is built in
      * @param connection the road's connection (its two destinations)
      * @param segments   the road's segments, not changed
-     * @param spans      the road's spans, not changed, may be null
+     * @param spans      the road's tunnel and bridge stretches, not changed, may be null
      * @param targetY    computeTargetY's heights, one per segment, not changed
      * @param cfg        RoadWeaver's generation config, may be null (then its global slope limit is used)
      * @return the heights to use instead (aligned with TunnelPlan.keptSegments), or {@code targetY} itself when
@@ -158,14 +156,14 @@ public final class RoadTunnelPlanner {
 
         int[] newY = originalY.clone();
         boolean[] trimmed = new boolean[n];
-        int step2 = cfg != null && !cfg.slopeLimitEnabled() ? UNLIMITED_SLOPE_STEP
+        int step2 = cfg != null && !cfg.slopeLimitEnabled() ? RoadWeaverAccessor.UNLIMITED_SLOPE_STEP
                 : Math.max(0, Math.min(8, cfg != null ? cfg.maxSlopeStepPerTwoSegments()
                 : RoadWeaverAccessor.maxSlopeStepPerTwoSegments()));
         int worldFloor = level.getMinBuildHeight() + 8;
-        // Water crossings (RoadWeaver's BRIDGE spans): a tunnel there would run under the water and flood.
+        // Water crossings (RoadWeaver's bridge stretches): a tunnel there would run under the water and flood.
         boolean[] overWater = spanMask(segments, spans, SpanType.BRIDGE);
 
-        // ---- Runs of blocked segments, a run whose ramp would hit another run absorbs it ----
+        // ---- Blocked stretches, one whose ramp would hit another blocked stretch absorbs it ----
         List<int[]> runs = new ArrayList<>();
         for (int i = 0; i < n; ) {
             if (lowest[i] == RoadObstacles.NOT_BLOCKED) {
@@ -200,9 +198,10 @@ public final class RoadTunnelPlanner {
                 left = rampStart(originalY, lowest, overWater, s, floor, step2, -1);
                 right = rampStart(originalY, lowest, overWater, e, floor, step2, 1);
                 /*
-                    A ramp running into the next blocked run: dig both as one run. Never with a run that
-                    can't be dug whatever happens (water, the road's own destination), and never for
-                    such a run: the merged run would be trimmed whole, taking the road between with it.
+                    A ramp running into the next blocked stretch: dig both as one. Never with a blocked
+                    stretch that can't be dug whatever happens (water, the road's own destination), and never
+                    for such a stretch: the merged stretch would be trimmed whole, taking the road between
+                    with it.
                  */
                 if (neverDug(obstacles, segments, overWater, s, e)) {
                     left = left == RAMP_HIT_BLOCKED ? RAMP_OUT_OF_ROAD : left;
@@ -217,7 +216,7 @@ public final class RoadTunnelPlanner {
                     s = runs.remove(r - 1)[0];
                     r--;
                     merged = true;
-                    // that run was already decided on its own: undo it, the merged run decides again
+                    // that blocked stretch was already decided on its own: undo it, the merged one decides again
                     for (int i = s; i <= e; i++) {
                         trimmed[i] = false;
                         newY[i] = originalY[i];
@@ -261,7 +260,7 @@ public final class RoadTunnelPlanner {
             runs.set(r, new int[]{s, e});
         }
 
-        // ---- The runs that can't be dug are trimmed ----
+        // ---- The blocked stretches that can't be dug are trimmed ----
         RoadTrimResult trim = RoadTrimPlanner.plan(segments, spans, newY, trimmed, obstacles, from, to);
         if (trim.dropped()) {
             PLAN.set(TunnelPlan.dropped(segments));
@@ -272,8 +271,8 @@ public final class RoadTunnelPlanner {
         }
 
         /*
-            ---- Spans: drop those touching a lowered segment, add TUNNEL spans for lowered stretches ----
-            A lowered stretch is underground: a BRIDGE span over it (the road crossed water there) would
+            ---- Spans: drop those touching a lowered segment, add tunnel stretches for lowered stretches ----
+            A lowered stretch is underground: a bridge stretch over it (the road crossed water there) would
             still make RoadWeaver plan a bridge, its buoys and bank signs on top of the tunnel.
          */
         List<RoadSpan> keptSpans = spansWithoutLowered(segments, trim.keptSpans(), newY, originalY);
@@ -283,13 +282,20 @@ public final class RoadTunnelPlanner {
             curves and diagonals leave no uncarved wedge between two segment boxes.
          */
         List<int[]> boxes = new ArrayList<>();
+        // A lowered segment in an already decorated chunk is never paved by RoadWeaver: no tunnel stretch, no clearing.
+        boolean[] unpaved = new boolean[n];
+        for (int i = 0; i < n; i++) {
+            BlockPos m = segments.get(i).middlePos();
+            unpaved[i] = !trimmed[i] && newY[i] < originalY[i] && RoadLevel.isDecorated(level, m.getX() >> 4,
+                    m.getZ() >> 4);
+        }
         for (int i = 0; i < n; ) {
-            if (trimmed[i] || newY[i] >= originalY[i]) {
+            if (trimmed[i] || newY[i] >= originalY[i] || unpaved[i]) {
                 i++;
                 continue;
             }
             int s = i;
-            while (i < n && !trimmed[i] && newY[i] < originalY[i]) {
+            while (i < n && !trimmed[i] && newY[i] < originalY[i] && !unpaved[i]) {
                 boxes.add(tunnelBox(List.of(segments.get(i)), newY[i], clearHeight, margin));
                 if (i > s) {
                     boxes.add(tunnelBox(List.of(segments.get(i - 1), segments.get(i)), Math.max(newY[i - 1], newY[i]),
@@ -309,12 +315,13 @@ public final class RoadTunnelPlanner {
     private static final int RAMP_OUT_OF_ROAD = -1;
 
     /**
-     * Walks outward from a run's end until the ramp rising from the tunnel floor meets the road's own height.
+     * Walks outward from a blocked stretch's end until the ramp rising from the tunnel floor meets the road's own
+     * height.
      *
      * @param originalY the road's heights, not changed
      * @param lowest    per segment, the lowest blocking structure Y or RoadObstacles.NOT_BLOCKED, not changed
      * @param overWater per segment, true inside a water crossing, not changed
-     * @param runEnd    the run's first (dir -1) or last (dir +1) segment index
+     * @param runEnd    the blocked stretch's first (dir -1) or last (dir +1) segment index
      * @param floor     the tunnel floor Y
      * @param step2     the height step allowed per two segments
      * @param dir       -1 to walk toward the road's start, +1 toward its end
@@ -351,7 +358,7 @@ public final class RoadTunnelPlanner {
      * Lowers the segments of a ramp found by rampStart.
      *
      * @param newY      the planned heights, mutated
-     * @param runEnd    the run's first (dir -1) or last (dir +1) segment index
+     * @param runEnd    the blocked stretch's first (dir -1) or last (dir +1) segment index
      * @param floor     the tunnel floor Y
      * @param step2     the height step allowed per two segments
      * @param dir       -1 toward the road's start, +1 toward its end
@@ -371,12 +378,13 @@ public final class RoadTunnelPlanner {
     }
 
     /**
-     * Marks the segments inside spans of one type (span start and end matched by segment middle).
+     * Marks the segments inside the stretches of one type, tunnel or bridge (a stretch's start and end matched by
+     * segment middle).
      *
      * @param segments the road's segments, not changed
-     * @param spans    the road's spans, not changed, may be null
-     * @param type     the span type to mark
-     * @return one flag per segment, true inside a span of that type
+     * @param spans    the road's tunnel and bridge stretches, not changed, may be null
+     * @param type     the stretch type to mark (TUNNEL or BRIDGE)
+     * @return one flag per segment, true inside a stretch of that type
      */
     private static boolean[] spanMask(List<RoadSegmentPlacement> segments, @Nullable List<RoadSpan> spans, SpanType type) {
         boolean[] mask = new boolean[segments.size()];
@@ -417,13 +425,13 @@ public final class RoadTunnelPlanner {
     }
 
     /**
-     * Tells whether a run is never dug, whatever its depth or ramps.
+     * Tells whether a blocked stretch is never dug, whatever its depth or ramps.
      *
      * @param obstacles the road's obstacles
      * @param segments  the road's segments, not changed
      * @param overWater per segment, true inside a water crossing, not changed
-     * @param s         the run's first segment index
-     * @param e         the run's last segment index
+     * @param s         the blocked stretch's first segment index
+     * @param e         the blocked stretch's last segment index
      * @return true over water, on the road's own destination, or in a no-road zone
      */
     private static boolean neverDug(RoadObstacles obstacles, List<RoadSegmentPlacement> segments, boolean[] overWater,
@@ -433,13 +441,13 @@ public final class RoadTunnelPlanner {
     }
 
     /**
-     * Drops the spans touching a segment lowered into a tunnel.
+     * Drops the tunnel and bridge stretches touching a segment lowered into a tunnel.
      *
      * @param segments  the road's segments, not changed
-     * @param spans     the spans left after trimming, not changed
+     * @param spans     the tunnel and bridge stretches left after trimming, not changed
      * @param newY      the planned heights, not changed
      * @param originalY the road's heights, not changed
-     * @return a new list of the spans kept. A span whose ends aren't segment middles is kept
+     * @return a new list of the stretches kept. A stretch whose ends aren't segment middles is kept
      */
     private static List<RoadSpan> spansWithoutLowered(List<RoadSegmentPlacement> segments, List<RoadSpan> spans,
                                                       int[] newY, int[] originalY) {
@@ -477,7 +485,8 @@ public final class RoadTunnelPlanner {
     }
 
     /**
-     * Builds the dig volume above lowered segments.
+     * Builds the dig volume above lowered segments. Also used for the cleared junctions of snapped roads
+     * (SnapJunctionShaper.recordNewTunnelBoxes).
      * <p>
      * Their columns widened by the road margin, from {@code roadY} (RoadWeaver's road Y is the first air block,
      * the road block sits just below it) up to the clearance. The planner keeps roadY + clearHeight + 1 below
@@ -489,7 +498,7 @@ public final class RoadTunnelPlanner {
      * @param margin      the road's margin (blocks)
      * @return a box of TunnelStore.BOX_INTS ints (minX, minZ, maxX, maxZ, floorY, ceilY)
      */
-    private static int[] tunnelBox(List<RoadSegmentPlacement> segments, int roadY, int clearHeight, int margin) {
+    public static int[] tunnelBox(List<RoadSegmentPlacement> segments, int roadY, int clearHeight, int margin) {
         int minX = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
         for (RoadSegmentPlacement segment : segments) {
             for (BlockPos p : RoadObstacles.columnsOf(segment)) {
@@ -503,13 +512,13 @@ public final class RoadTunnelPlanner {
     }
 
     /**
-     * Describes the structures over a run, for the debug log.
+     * Describes the structures over a blocked stretch, for the debug log.
      *
      * @param level     the level, to read structure ids from loaded chunks
      * @param obstacles the road's obstacles
      * @param segments  the road's segments, not changed
-     * @param s         the run's first segment index
-     * @param e         the run's last segment index
+     * @param s         the blocked stretch's first segment index
+     * @param e         the blocked stretch's last segment index
      * @return the start chunks, each with its structure ids when that chunk is loaded, plus "(own destination)"
      *         for the road's own destinations, "?" if none is known
      */

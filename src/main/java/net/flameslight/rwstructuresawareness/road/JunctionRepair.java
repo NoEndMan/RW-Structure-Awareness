@@ -15,15 +15,18 @@ import java.util.Set;
  * <p>
  * RoadWeaver's road snapping (RoadSnapService.trySnap) directs a side road onto a main road it runs alongside,
  * and blends a few "junction" segments, partially carved road path, so the side road bends into the main one.
+ * Each part of the side road pulled onto the main road is a snapped stretch: consecutive segments, given as a
+ * {first, last} segment index pair (trySnap's {@code runs}).
  * When both roads lead to the same destination, it then cuts the side road (tryTruncateSharedEndpoint):
- * the stretch alongside, from the shared destination up to the stretch's far edge, is replaced by one
+ * the snapped stretch, from the shared destination up to the stretch's far edge, is replaced by one
  * positionless anchor segment on the main road, which only tells RoadWeaver's map where the road ends.
  * The cut also throws away the junction segments it just blended. On top of that, RoadWeaver's PathFeature
- * never paves a road's first ~9 and last ~7 segments (its segment counter must lie in [8, size - 8]). So the
+ * never paves a road's first ~9 and last ~7 segments (its segment counter must lie in [8, size - 8]). So,
  * visibly, the result is a side road that stops several blocks before the main road.
  * <p>
  * The repair (restoreJunction), run right after the cut (see RoadSnapServiceMixin), has three steps:
  *  1. Puts the dropped junction segments back between the kept part and the anchor, with their blended heights.
+ *     These are RoadWeaver's 3 junction pieces, with the heights and clearing SnapJunctionShaper gave them.
  *  2. Adds a few positionless lead segments on the main road next to the joint, at the main road's heights.
  *     They cover PathFeature's unpaved first or last segments, so the junction falls in the paved range. They
  *     lie between the main road's segment middles, never on one, because PathFeature skips a middle it
@@ -33,12 +36,27 @@ import java.util.Set;
  * <p>
  */
 public final class JunctionRepair {
-    /** RoadSnapService.TRANSITION in RoadWeaver 2.3.0. */
-    private static final int TRANSITION = 3;
-    /** Positionless segments after the junction at a shared end: with the anchor, PathFeature's last 7 unpaved. */
-    private static final int LEAD_OUT = 6;
+    /** The first segment index PathFeature paves (it counts segments from index 2 and paves from the 8th on). */
+    public static final int FIRST_PAVED_INDEX = 9;
+    /** How many of a road's last segments PathFeature never paves (its count must stay at most size - 8). */
+    public static final int UNPAVED_AT_END = 6;
+    /** Positionless segments after the junction at a shared end: with the anchor, past PathFeature's unpaved end. */
+    private static final int LEAD_OUT = UNPAVED_AT_END;
     /** Positionless segments before the junction at a shared start: with the anchor, PathFeature's first 9 unpaved. */
-    private static final int LEAD_IN = 8;
+    private static final int LEAD_IN = FIRST_PAVED_INDEX - 1;
+
+    /**
+     * Tells whether PathFeature paves a segment index at all (PathFeature.processRoadDataInChunk: index 2 to
+     * size - 3, and its running count of new middles 8 to size - 8). Counted without repeated middles, the usual
+     * case: a middle another road already paved in that chunk lowers the count.
+     *
+     * @param index the segment's index
+     * @param size  the road's segment count
+     * @return true if index lies in FIRST_PAVED_INDEX .. size - 1 - UNPAVED_AT_END
+     */
+    public static boolean isPavedIndex(int index, int size) {
+        return index >= FIRST_PAVED_INDEX && index < size - UNPAVED_AT_END;
+    }
 
     /**
      * Puts back the junction segments RoadWeaver's snap truncation dropped, and leads the road into the one
@@ -46,7 +64,7 @@ public final class JunctionRepair {
      *
      * @param segments the truncated result's segments, mutated in place
      * @param targetY  the truncated result's heights, mutated in place
-     * @param runs     trySnap's runs along the other road, {first, last} snapped segment index each
+     * @param runs     trySnap's snapped stretches along the other road, {first, last} segment index each
      * @param snapped  the road's segments before truncation, not changed
      * @param snappedY their heights, not changed
      * @param other    the road it joins, not changed, may be null
@@ -70,7 +88,7 @@ public final class JunctionRepair {
             if (endAnchor) {
                 int[] run = runs.get(runs.size() - 1);
                 int start = run[0];
-                int trans = Math.min(TRANSITION, (run[1] - run[0] + 2) / 2);
+                int trans = SnapJunctionShaper.junctionLength(run);
                 if (segments.size() - 1 != start || start + trans > snapped.size()) {
                     return; // kept prefix isn't snapped[0 .. start-1]
                 }
@@ -83,7 +101,7 @@ public final class JunctionRepair {
             } else {
                 int[] run = runs.get(0);
                 int end = run[1];
-                int trans = Math.min(TRANSITION, (run[1] - run[0] + 2) / 2);
+                int trans = SnapJunctionShaper.junctionLength(run);
                 if (segments.size() - 1 != snapped.size() - (end + 1) || end - trans + 1 < 0) {
                     return; // kept tail isn't snapped[end+1 .. n-1]
                 }
@@ -234,6 +252,48 @@ public final class JunctionRepair {
     }
 
     /**
+     * Drops the snapped stretches that reach into an end RoadWeaver's snap already cut.
+     * <p>
+     * A cut end is the road's leading or trailing segments without positions (the anchor and the lead segments),
+     * then its junction segments, SnapJunctionShaper.TRANSITION of them. Near a busy shared destination, another
+     * road's own repaired junction can lie right beside it. A snapped stretch reaching into the cut end would then
+     * cut the road a second time, against that other road, and "restore" the first repair's unpaved lead segments
+     * as the new junction.
+     *
+     * @param runs the snapped stretches extractRuns found, {first, last} segment index each, not changed, may be
+     *             null
+     * @param road the road being snapped, not changed, may be null
+     * @return {@code runs} itself when no end was cut, otherwise a new list of the snapped stretches clear of both
+     *         cut ends
+     */
+    public static List<int[]> runsOutsideCutEnds(List<int[]> runs, List<RoadSegmentPlacement> road) {
+        if (runs == null || runs.isEmpty() || road == null || road.isEmpty()) {
+            return runs;
+        }
+        int n = road.size();
+        int leading = 0;
+        while (leading < n && isAnchor(road.get(leading))) {
+            leading++;
+        }
+        int trailing = 0;
+        while (trailing < n - leading && isAnchor(road.get(n - 1 - trailing))) {
+            trailing++;
+        }
+        if (leading == 0 && trailing == 0) {
+            return runs;
+        }
+        int firstFree = leading == 0 ? 0 : leading + SnapJunctionShaper.TRANSITION;
+        int lastFree = trailing == 0 ? n - 1 : n - 1 - trailing - SnapJunctionShaper.TRANSITION;
+        List<int[]> kept = new ArrayList<>(runs.size());
+        for (int[] run : runs) {
+            if (run[0] >= firstFree && run[1] <= lastFree) {
+                kept.add(run);
+            }
+        }
+        return kept;
+    }
+
+    /**
      * Tells whether a segment has no positions: RoadWeaver's truncation anchor, or one of the lead segments.
      *
      * @param segment the segment, may be null
@@ -247,13 +307,13 @@ public final class JunctionRepair {
      * Logs a restored junction (debug).
      *
      * @param side    "start" or "end"
-     * @param runEdge the run's edge segment index
+     * @param runEdge the snapped stretch's edge segment index
      * @param trans   the junction segments restored
      * @param anchor  the road's anchor after the repair
      */
     private static void log(String side, int runEdge, int trans, RoadSegmentPlacement anchor) {
-        ModLogger.debug("Road snap truncated a road at its shared {} (run edge segment {}): restored {} junction "
-                + "segment(s) leading into the road it joins at {}.", side, runEdge, trans,
+        ModLogger.debug("Road snap truncated a road at its shared {} (snapped stretch edge segment {}): restored {} "
+                + "junction segment(s) leading into the road it joins at {}.", side, runEdge, trans,
                 anchor.middlePos() == null ? "?" : anchor.middlePos().toShortString());
     }
 }
